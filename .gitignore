@@ -1,0 +1,10 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+/SpeedTest*.HDF5

@@ -1,0 +1,10 @@
+# Simulation-only launch; no sharpa_output node or hardware SDK is started.
+# MuJoCo XML and meshes stay in the external SHARPA_MODELS checkout.
+# Finger dynamics/position gains are retained; untracked wrists/head are fixed.
+mujoco_sim:
+  ros__parameters:
+    timeout_sec: 0.5
+    feedback_hz: 30.0
+# Physics: 2 ms steps, implicitfast. Viewer sync: 30 Hz.
+# Expired input holds the current simulated pose; fresh input resumes tracking.
+# Feedback: /sim/sharpa/{left,right}/joint_states (qpos/qvel, not target echoes).

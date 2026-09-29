@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Build and run the project-native Manus ROS producer without copying the SDK."""
+from __future__ import annotations
+
+import argparse
+import os
+from pathlib import Path
+import subprocess
+
+from workspace import ROOT
+
+BUILD_DIR = ROOT / "build" / "manus-native"
+BINARY = BUILD_DIR / "manus_ros"
+
+
+def _sdk_root(value: str) -> Path:
+    if not value.strip():
+        raise SystemExit("Set SHARPA_MANUS_SDK to your authorized sharpa-manus-sdk checkout.")
+    root = Path(value).expanduser().resolve()
+    manus_sdk = root / "client" / "ManusSDK"
+    if not (
+        (manus_sdk / "include" / "ManusSDK.h").is_file()
+        and (manus_sdk / "lib" / "libManusSDK_Integrated.so").is_file()
+    ):
+        raise SystemExit(f"Missing authorized Manus SDK headers or library under {manus_sdk}")
+    return root
+
+
+def _needs_fresh_configure() -> bool:
+    """Detect the retired client build tree with a stale compiler or target."""
+    cache = BUILD_DIR / "CMakeCache.txt"
+    if not cache.is_file():
+        return False
+    cache_text = cache.read_text(errors="replace")
+    return (
+        "MANUS_SOURCE" in cache_text
+        or "SharpaManusClient" in cache_text
+        or "/.pixi/envs/client/" in cache_text
+    )
+
+
+def _build(manus_sdk: Path) -> None:
+    configure = [
+        "cmake",
+        "-S",
+        str(ROOT / "native"),
+        "-B",
+        str(BUILD_DIR),
+        "-G",
+        "Ninja",
+        "-DCMAKE_BUILD_TYPE=Release",
+        f"-DMANUS_SDK={manus_sdk}",
+    ]
+    if _needs_fresh_configure():
+        # The former client environment cached a different compiler and target.
+        configure.insert(1, "--fresh")
+    subprocess.run(configure, cwd=ROOT, check=True)
+    subprocess.run(["cmake", "--build", str(BUILD_DIR), "--parallel", "2"], cwd=ROOT, check=True)
+
+
+def _calibration_dir(value: str, sdk_root: Path) -> Path:
+    calibration_dir = Path(value).expanduser().resolve() if value.strip() else sdk_root / "client"
+    if not calibration_dir.is_dir():
+        raise SystemExit(f"Missing Manus calibration directory: {calibration_dir}")
+    return calibration_dir
+
+
+def _set_runtime_library_path(manus_sdk: Path) -> None:
+    """Make the launch sdk_root select the matching external SDK library."""
+    library_dir = str(manus_sdk / "lib")
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = (
+        library_dir if not existing else f"{library_dir}{os.pathsep}{existing}"
+    )
+
+
+def _native_ros_arguments(arguments: list[str], calibration_dir: Path) -> list[str]:
+    if arguments and arguments[0] != "--ros-args":
+        raise SystemExit("Native arguments must begin with --ros-args.")
+    ros_arguments = list(arguments) or ["--ros-args"]
+    if not any("calibration_dir:=" in argument for argument in ros_arguments):
+        ros_arguments.extend(["-p", f"calibration_dir:={calibration_dir}"])
+    return ros_arguments
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Forward native ROS arguments after --ros-args, for example: "
+            "pixi run manus-native -- --ros-args -p calibration_dir:=/path/to/calibration"
+        ),
+    )
+    parser.add_argument("action", choices=["build", "run"])
+    parser.add_argument("--sdk-root", default=os.environ.get("SHARPA_MANUS_SDK", ""))
+    parser.add_argument(
+        "--calibration-dir",
+        default="",
+        help="external calibration directory; defaults to <sdk-root>/client",
+    )
+    args, native_arguments = parser.parse_known_args()
+    sdk_root = _sdk_root(args.sdk_root)
+    manus_sdk = sdk_root / "client" / "ManusSDK"
+    if args.action == "build":
+        _build(manus_sdk)
+        return
+
+    if not BINARY.is_file():
+        raise SystemExit("Build first: pixi run manus-build")
+    calibration_dir = _calibration_dir(args.calibration_dir, sdk_root)
+    _set_runtime_library_path(manus_sdk)
+    os.execv(str(BINARY), [str(BINARY), *_native_ros_arguments(native_arguments, calibration_dir)])
+
+
+if __name__ == "__main__":
+    main()

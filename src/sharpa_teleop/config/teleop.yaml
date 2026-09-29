@@ -1,0 +1,34 @@
+# `pixi run manus` starts native capture, raw-pose resampling, and retargeting.
+# `pixi run real [left|right]` starts only sharpa_output, which consumes direct retarget commands.
+# Manus SDK/calibration and worker settings, plus real output lifecycle and serial settings, are launch arguments.
+# Parameters are read at startup; restart nodes after changing this file.
+manus_input:
+  ros__parameters:
+    output_hz: 250.0
+    buffer_delay_sec: 0.04
+    timeout_sec: 0.5
+retarget:
+  ros__parameters:
+    # Original local input timestamp is preserved; expired results are dropped.
+    timeout_sec: 0.5
+sharpa_output:
+  ros__parameters:
+    dry_run: true
+    left_serial: ""
+    right_serial: ""
+    # The YAML default is conservative; `pixi run real` overrides this to true.
+    # It auto-arms only once after fresh selected-side targets; disable or fault cancels it.
+    auto_enable: false
+    # On Ctrl+C/SIGTERM only, a healthy armed real output homes selected joints before disabling.
+    return_to_zero_on_exit: false
+    # Measured all-zero convergence must fit these bounds; failure skips further motion and disables.
+    homing_timeout_sec: 10.0
+    homing_tolerance_rad: 0.02
+    # Both monotonic receipt age and original source age must remain fresh.
+    timeout_sec: 0.5
+    future_tolerance_sec: 0.0
+    max_velocity: 1.0  # radians/second per joint, starts from measured pose
+    control_hz: 500.0
+    buffer_delay_sec: 0.08  # Total source-time lag, including input buffering and retargeting
+    feedback_hz: 30.0
+    startup_timeout_sec: 5.0

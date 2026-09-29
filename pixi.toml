@@ -1,0 +1,74 @@
+[workspace]
+authors = ["Fcl <58226448@qq.com>"]
+channels = ["https://prefix.dev/robostack-jazzy", "conda-forge"]
+name = "sharpa_teleop"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[pypi-options]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+extra-index-urls = ["https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"]
+
+[dependencies]
+python = "3.12.*"
+ros-jazzy-ros-base = "*"
+ros-jazzy-rclcpp = "*"
+ros-jazzy-sensor-msgs = "*"
+ros-jazzy-geometry-msgs = "*"
+ros-jazzy-std-srvs = "*"
+colcon-common-extensions = "*"
+cmake = "*"
+ninja = "*"
+cxx-compiler = "*"
+eigen = "*"
+sysroot_linux-64 = "2.34.*"
+libusb = "*"
+libudev = "*"
+zlib = "*"
+setuptools = "<80"
+numpy = "<2"
+h5py = "*"
+pyyaml = "*"
+
+[pypi-dependencies]
+mujoco = "==3.3.6"
+
+[activation.env]
+ROS_DOMAIN_ID = "42"
+RETARGET_PYTHON = "$PIXI_PROJECT_ROOT/.pixi/envs/retarget/bin/python"
+SHARPA_MANUS_SDK = "$PIXI_PROJECT_ROOT/../sharpa-manus-sdk"
+SHARPA_MODELS = "$PIXI_PROJECT_ROOT/../sharpa-urdf-usd-xml"
+
+[tasks]
+build = "python scripts/workspace.py build"
+manus-build = "python scripts/manus_client.py build"
+manus-native = { cmd = "python scripts/manus_client.py run", depends-on = ["manus-build"] }
+manus = { cmd = "python scripts/workspace.py manus", depends-on = ["build", "manus-build"] }
+sim = { cmd = "python scripts/workspace.py sim", depends-on = ["build"] }
+real = { cmd = "python scripts/workspace.py real", depends-on = ["build"] }
+doctor = "python scripts/workspace.py doctor"
+test = "python -m unittest discover -s tests -v"
+record-speed-test = "python scripts/record_speed_test.py"
+help = "python scripts/workspace.py --help"
+
+[feature.retarget]
+channels = ["conda-forge"]
+
+[feature.retarget.dependencies]
+python = "3.10.*"
+c-compiler = "*"
+numpy = "1.26.*"
+scipy = "1.14.*"
+pyzmq = "26.*"
+protobuf = "3.20.*"
+rich = "14.*"
+matplotlib = "3.7.*"
+pip = "*"
+
+[feature.retarget.pypi-dependencies]
+casadi = "==3.7.0"
+mujoco = "==3.3.6"
+
+[environments]
+default = { features = [], solve-group = "ros" }
+retarget = { features = ["retarget"], no-default-feature = true }
