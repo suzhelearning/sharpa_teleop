@@ -48,7 +48,7 @@ SHARPA_MANUS_CALIBRATION_DIR = "$PIXI_PROJECT_ROOT/calibration"
 build = "python scripts/workspace.py build"
 manus-build = "python scripts/manus_client.py build"
 manus-native = { cmd = "python scripts/manus_client.py run", depends-on = ["manus-build"] }
-manus = { cmd = "python scripts/workspace.py manus", depends-on = ["build", "manus-build"] }
+manus = "python scripts/workspace.py manus"
 rawmanus = { cmd = "python scripts/workspace.py rawmanus", depends-on = ["build"] }
 sim = { cmd = "python scripts/workspace.py sim", depends-on = ["build"] }
 real = { cmd = "python scripts/workspace.py real", depends-on = ["build"] }

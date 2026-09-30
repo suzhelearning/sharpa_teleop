@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -79,7 +80,9 @@ def _set_runtime_library_path(manus_sdk: Path) -> None:
     )
 
 
-def _native_ros_arguments(arguments: list[str], calibration_dir: Path | None) -> list[str]:
+def _native_ros_arguments(
+    arguments: list[str], calibration_dir: Path | None, calibration_operator: str
+) -> list[str]:
     if arguments and arguments[0] != "--ros-args":
         raise SystemExit("Native arguments must begin with --ros-args.")
     ros_arguments = list(arguments) or ["--ros-args"]
@@ -87,6 +90,10 @@ def _native_ros_arguments(arguments: list[str], calibration_dir: Path | None) ->
         argument.startswith("calibration_dir:=") for argument in ros_arguments
     ):
         ros_arguments.extend(["-p", f"calibration_dir:={calibration_dir}"])
+    if calibration_operator and not any(
+        argument.startswith("calibration_operator:=") for argument in ros_arguments
+    ):
+        ros_arguments.extend(["-p", f"calibration_operator:={json.dumps(calibration_operator)}"])
     return ros_arguments
 
 
@@ -105,6 +112,10 @@ def main() -> None:
         default=os.environ.get("SHARPA_MANUS_CALIBRATION_DIR", ""),
         help="operator calibration directory; defaults to SHARPA_MANUS_CALIBRATION_DIR",
     )
+    parser.add_argument(
+        "--calibration-operator", default="",
+        help="operator prefix for <operator>{Left,Right}MetaglovePro.mcal",
+    )
     args, native_arguments = parser.parse_known_args()
     sdk_root = _sdk_root(args.sdk_root)
     manus_sdk = sdk_root / "client" / "ManusSDK"
@@ -120,7 +131,9 @@ def main() -> None:
         else _calibration_dir(args.calibration_dir)
     )
     _set_runtime_library_path(manus_sdk)
-    os.execv(str(BINARY), [str(BINARY), *_native_ros_arguments(native_arguments, calibration_dir)])
+    os.execv(str(BINARY), [
+        str(BINARY), *_native_ros_arguments(native_arguments, calibration_dir, args.calibration_operator)
+    ])
 
 
 if __name__ == "__main__":

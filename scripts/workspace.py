@@ -28,6 +28,23 @@ def _launch_argument(arguments: list[str], name: str) -> str | None:
     return None
 
 
+def _operator_calibration_dir(operator: str, root: Path) -> Path:
+    if not operator or operator in {".", ".."} or Path(operator).name != operator:
+        raise ValueError("operator must be a directory name, not a path")
+    directory = root.expanduser().resolve() / operator
+    for side in ("Left", "Right"):
+        path = directory / f"{operator}{side}MetaglovePro.mcal"
+        try:
+            with path.open("rb") as stream:
+                if not stream.read(1):
+                    raise ValueError(f"Empty calibration for operator {operator!r}: {path}")
+        except OSError as error:
+            raise ValueError(
+                f"Cannot read calibration for operator {operator!r}: {path}: {error}"
+            ) from error
+    return directory
+
+
 def ros_env():
     setup = ROOT / "install/setup.bash"
     if not setup.exists():
@@ -59,19 +76,26 @@ Raw-keypoint viewer:
   This mode starts only the viewer and does not build or validate the Manus SDK.
 
 Producer terminal:
-  pixi run manus
+  pixi run manus <operator>
   `manus` builds the ROS workspace and project-native `manus_ros`, then starts
   it with the direct raw-pose retargeter. `manus_ros` publishes
   /manus/{left,right}/raw_poses at its actual SDK callback rate, and `retarget`
   subscribes to those topics directly. It needs a MANUS SDK-component license,
   paired gloves, and operator calibration. Do not run another MANUS
   Core/Integrated instance concurrently.
+  An operator selects SHARPA_MANUS_CALIBRATION_DIR/<operator>, normally
+  calibration/<operator>/. Both <operator>LeftMetaglovePro.mcal and
+  <operator>RightMetaglovePro.mcal must be readable and non-empty; no fallback.
+  A person must be specified, either positionally or via calibration_operator.
+  Operator selection cannot be combined with explicit calibration_dir or
+  calibration_operator arguments, or with_client:=false.
 
   To use an existing raw ROS publisher, omit only the managed native adapter:
-  pixi run manus with_client:=false
-  This mode starts only the retargeter. The external publisher must provide
-  25-pose geometry_msgs/PoseArray messages on /manus/{left,right}/raw_poses in
-  the same ROS domain.
+  pixi run manus calibration_operator:=syz with_client:=false
+  This mode starts only the retargeter; it still requires an operator name.
+  The external publisher is responsible for that person's calibration and must
+  provide 25-pose geometry_msgs/PoseArray messages on
+  /manus/{left,right}/raw_poses in the same ROS domain.
 
 Consumer terminal:
   pixi run sim
@@ -99,8 +123,8 @@ Shutdown and safety:
   an optional debug/recovery service, not a normal startup step.
 
 Independent launch arguments:
-  pixi run manus [config/sdk_root/calibration_dir/worker_python/with_client/project_root arguments]
-  pixi run rawmanus [sdk_root/calibration_dir/with_client/project_root arguments]
+  pixi run manus <operator> [config/sdk_root/worker_python/project_root arguments]
+  pixi run rawmanus [sdk_root/calibration_dir/calibration_operator/with_client/project_root arguments]
   pixi run sim [config/models_root/headless arguments]
   pixi run real [config/sdk_root/native_sdk_root/safety/serial arguments]
   Configuration: src/sharpa_teleop/config/sim.yaml and teleop.yaml
@@ -136,8 +160,34 @@ Safety:
         return
 
     if args.action == "manus":
+        if extra and ":=" not in extra[0] and not extra[0].startswith("-"):
+            operator, *extra = extra
+            if any(_launch_argument(extra, key) is not None
+                   for key in ("calibration_dir", "calibration_operator")):
+                parser.error("manus accepts an operator or explicit calibration settings, not both")
+            with_client = _launch_argument(extra, "with_client")
+            if with_client is not None and with_client.strip().lower() in {"false", "0"}:
+                parser.error("manus operator selection requires with_client:=true")
+            try:
+                calibration = _operator_calibration_dir(
+                    operator, Path(os.environ["SHARPA_MANUS_CALIBRATION_DIR"])
+                )
+            except ValueError as error:
+                parser.error(str(error))
+            extra[:0] = [f"calibration_dir:={calibration}", f"calibration_operator:={operator}"]
+        elif not (_launch_argument(extra, "calibration_operator") or "").strip():
+            parser.error("manus requires an operator; use: pixi run manus syz")
         configured_sdk_root = _launch_argument(extra, "sdk_root")
         sdk_root(configured_sdk_root) if configured_sdk_root is not None else sdk_root()
+        # Validate operator selection before building or starting any producer.
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts/workspace.py"), "build"],
+            cwd=ROOT, check=True,
+        )
+        subprocess.run(
+            [sys.executable, str(ROOT / "scripts/manus_client.py"), "build"],
+            cwd=ROOT, check=True,
+        )
         launch_file = "manus.launch.py"
         launch_args = [f"project_root:={ROOT}", *extra]
     elif args.action == "rawmanus":

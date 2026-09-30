@@ -15,6 +15,7 @@ def generate_launch_description():
     defaults = {
         "sdk_root": os.environ.get("SHARPA_MANUS_SDK", ""),
         "calibration_dir": os.environ.get("SHARPA_MANUS_CALIBRATION_DIR", ""),
+        "calibration_operator": "",
         "with_client": "true",
         # workspace.py supplies ROOT explicitly; this supports direct Pixi launch too.
         "project_root": os.environ.get("PIXI_PROJECT_ROOT", os.getcwd()),
@@ -30,6 +31,8 @@ def generate_launch_description():
             LaunchConfiguration("sdk_root"),
             "--calibration-dir",
             LaunchConfiguration("calibration_dir"),
+            "--calibration-operator",
+            LaunchConfiguration("calibration_operator"),
         ],
         condition=IfCondition(LaunchConfiguration("with_client")),
         cwd=LaunchConfiguration("project_root"),

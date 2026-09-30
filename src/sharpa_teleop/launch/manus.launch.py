@@ -18,6 +18,7 @@ def generate_launch_description():
         "config": os.path.join(get_package_share_directory("sharpa_teleop"), "config", "teleop.yaml"),
         "sdk_root": os.environ.get("SHARPA_MANUS_SDK", ""),
         "calibration_dir": os.environ.get("SHARPA_MANUS_CALIBRATION_DIR", ""),
+        "calibration_operator": "",
         "worker_python": os.environ.get("RETARGET_PYTHON", ""),
         "with_client": "true",
         # workspace.py supplies ROOT explicitly; this supports direct Pixi launch too.
@@ -37,6 +38,8 @@ def generate_launch_description():
             LaunchConfiguration("sdk_root"),
             "--calibration-dir",
             LaunchConfiguration("calibration_dir"),
+            "--calibration-operator",
+            LaunchConfiguration("calibration_operator"),
         ],
         condition=IfCondition(LaunchConfiguration("with_client")),
         cwd=LaunchConfiguration("project_root"),

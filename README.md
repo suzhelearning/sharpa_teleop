@@ -9,7 +9,7 @@
 ## 数据链路
 
 ```text
-终端 1：pixi run manus
+终端 1：pixi run manus syz
 
 Manus 手套
     │ 本项目原生 C++ 适配器，直接调用 Manus SDK
@@ -97,7 +97,7 @@ pixi run doctor
 
 | 命令 | 用途 |
 | --- | --- |
-| `pixi run manus` | 构建并启动采集与重定向生产者 |
+| `pixi run manus <人员>` | 校验人员标定后，构建并启动采集与重定向生产者；人员必填 |
 | `pixi run sim` | 构建 ROS 包并启动仿真消费者 |
 | `pixi run real [left\|right]` | 构建 ROS 包并启动真机消费者 |
 | `pixi run rawmanus` | 构建并启动原始关键点诊断窗口，默认同时启动采集 |
@@ -116,7 +116,7 @@ pixi run doctor
 终端 1 启动采集与重定向：
 
 ```bash
-pixi run manus
+pixi run manus syz
 ```
 
 终端 2 启动仿真：
@@ -147,7 +147,7 @@ pixi run sim headless:=true
 终端 1：
 
 ```bash
-pixi run manus
+pixi run manus syz
 ```
 
 终端 2，根据设备选择其中一条：
@@ -229,10 +229,10 @@ pixi run rawmanus with_client:=false
 ### 使用已有原始 ROS 发布者
 
 ```bash
-pixi run manus with_client:=false
+pixi run manus calibration_operator:=syz with_client:=false
 ```
 
-只启动重定向，不启动本项目采集适配器；该 Pixi 任务仍会执行其声明的构建依赖。外部发布者应在相同 ROS 域提供：
+只启动重定向，不启动本项目采集适配器；仍必须显式指定人员名，并执行构建。该模式由外部发布者负责加载该人员的标定。外部发布者应在相同 ROS 域提供：
 
 - `/manus/{left,right}/raw_poses` 上的 `geometry_msgs/PoseArray`，每手恰好 25 个位姿。
 - 与适配器一致的关键点顺序和手根相对坐标，位置单位 m。
@@ -242,7 +242,7 @@ pixi run manus with_client:=false
 
 ### 录制 SpeedTest
 
-先运行 `pixi run manus`，在另一个终端执行：
+先运行 `pixi run manus syz`，在另一个终端执行：
 
 ```bash
 # Ctrl+C 正常停止并保存到当前目录 SpeedTest.HDF5
@@ -280,7 +280,39 @@ HDF5 按 `left/`、`right/` 分组：
 
 `<default-site-packages>` 为 `$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/python3.12/site-packages`。`pixi.toml` 为已安装资源、解释器和 ROS 域定义默认值；标准工作流不依赖兄弟目录。只有有意替换资源版本时才覆盖相应路径，并在变更 Manus SDK 后重新运行 `pixi run manus-build`，确保构建链接和运行加载的 SDK 匹配。
 
-`calibration/` 用于本机操作者的私有标定，不能随仓库分发。操作者应将获授权的标定复制到该目录，或按 SDK 流程使用 SDK 自身标定。原生适配器从该目录读取 `Calibration_left.mcal`、`Calibration_right.mcal`；缺失文件会告警并保留 SDK 标定，但告警消失或保留 SDK 标定都不能等同于当前操作者已正确标定。
+`calibration/` 用于本机操作者的私有标定，不能随仓库分发。`manus` 必须显式指定人员，读取 `<人员>LeftMetaglovePro.mcal`、`<人员>RightMetaglovePro.mcal`，保留原始文件名；不能依赖通用文件名或 SDK 默认标定。
+
+按人员选择标定：
+
+```text
+calibration/
+├── syz/
+│   ├── syzLeftMetaglovePro.mcal
+│   └── syzRightMetaglovePro.mcal
+└── dmp/
+    ├── dmpLeftMetaglovePro.mcal
+    └── dmpRightMetaglovePro.mcal
+```
+
+将对应操作者的两份真实标定文件放到其目录后，启动时传入人员名：
+
+```bash
+pixi run manus syz
+pixi run manus zr
+pixi run manus sch
+pixi run manus dmp
+```
+
+人员名选择 `$SHARPA_MANUS_CALIBRATION_DIR/<人员>/`，默认即 `calibration/<人员>/`。例如 `zr` 对应 `zrLeftMetaglovePro.mcal`、`zrRightMetaglovePro.mcal`，`sch` 同理。CLI 和原生采集都会要求指定人员的两份文件可读且非空；缺失时直接报错，不回退到通用文件名、其他人员或 SDK 标定。程序不会证明标定内容确实属于该人员或当前手套；文件归属由操作者确认。人员名只能是单个目录名，不能传路径。
+
+不指定人员的 `pixi run manus` 会在构建和启动采集之前报错，提示使用 `pixi run manus syz`；已通过实际命令验证退出码为 `2`，且没有执行构建、ROS launch 或原生采集。只有 `calibration_dir:=...` 也不够，必须同时显式指定 `calibration_operator:=<人员>`。位置参数人员名不能与显式 `calibration_dir:=...`、`calibration_operator:=...` 或 `with_client:=false` 混用。所有人员目录和标定文件均由 `calibration/.gitignore` 排除，不会打入资源 wheel。
+
+已有其他目录布局时，可以不传位置参数人员名，显式指定目录和文件前缀，无需重命名：
+
+```bash
+pixi run manus calibration_dir:=/path/to/profiles/syz/manus calibration_operator:=syz
+pixi run rawmanus calibration_dir:=/path/to/profiles/syz/manus calibration_operator:=syz
+```
 
 ### Launch 参数与 YAML
 
@@ -288,15 +320,15 @@ HDF5 按 `left/`、`right/` 分组：
 
 | 命令 | 主要 launch 参数 |
 | --- | --- |
-| `manus` | `config`、`sdk_root`、`calibration_dir`、`worker_python`、`with_client`、`project_root` |
-| `rawmanus` | `sdk_root`、`calibration_dir`、`with_client`、`project_root` |
+| `manus` | `config`、`sdk_root`、`calibration_dir`、`calibration_operator`、`worker_python`、`with_client`、`project_root` |
+| `rawmanus` | `sdk_root`、`calibration_dir`、`calibration_operator`、`with_client`、`project_root` |
 | `sim` | `config`、`models_root`、`headless`、`smoothing_time_sec`、`control_hz`、`feedback_hz` |
 | `real` | `config`、`sdk_root`、`native_sdk_root`、`dry_run`、`auto_enable`、`return_to_zero_on_exit`、`homing_timeout_sec`、`homing_tolerance_rad`、`smoothing_time_sec`、`control_hz`、`left_serial`、`right_serial` |
 
 示例：
 
 ```bash
-pixi run manus calibration_dir:=/path/to/calibration
+pixi run manus calibration_dir:=/path/to/calibration/syz calibration_operator:=syz
 pixi run sim models_root:=/path/to/sharpa-urdf-usd-xml headless:=true
 pixi run real right right_serial:=RIGHT_SN auto_enable:=false
 ```
@@ -430,7 +462,9 @@ tests/                           现有 Python 回归测试
 
 可运行 `pixi run test` 检查现有安全边界、输出启停、重定向和仿真回归；通过测试或 `doctor` 不等于完成实机安全验证。真机延迟、网络下发频率、全关节运动范围和长期稳定性需要在具体设备与现场条件下测量。
 
-项目内依赖集成已用全新临时目录验证：仅复制源代码、锁文件和资源 wheel，不复制已有环境、构建产物或个人标定，`pixi install --all --locked`、ROS 构建及 `doctor` 均成功。隔离 ROS 域中的官方 IPOPT 双手求解和实际 headless MuJoCo 目标跟随通过；现有 22 项回归测试通过，原生采集适配器重新构建成功。该验证未启动真机输出，不代表已验证新主机的手套许可证或实机运动。
+项目内依赖集成已用全新临时目录验证：仅复制源代码、锁文件和资源 wheel，不复制已有环境、构建产物或个人标定，`pixi install --all --locked`、ROS 构建及 `doctor` 均成功。隔离 ROS 域中的官方 IPOPT 双手求解和实际 headless MuJoCo 目标跟随通过；该集成验证时的 22 项回归测试通过，原生采集适配器重新构建成功。该验证未启动真机输出，不代表已验证新主机的手套许可证或实机运动。
+
+人员选择另经定向回归与实际 CLI、原生进程烟测验证：CLI 将对应目录和人员前缀传入 ROS launch；原生进程实际读取 `<人员>LeftMetaglovePro.mcal`，缺少对应右手文件时直接退出，即使目录中存在通用右手标定也不回退。该烟测在隔离 ROS 域中执行，未初始化 Manus SDK、连接手套或启动真机输出；连接设备后的标定应用效果仍需实际确认。
 
 本仓库维护方已确认三套 `vendor/` 资源可随本仓库分发。该确认不改变任何接收者的授权边界：接收者仍必须遵守各 `vendor/` 资源原始的 `License`、`LICENSE.txt` 与 `NOTICE.txt`，并保留其中已有的许可和通知。个人操作者标定不随仓库分发；获得授权的标定只能由相应操作者按其许可使用。本项目源代码与上游资源的授权范围不同，ROS 包元数据标记为 `Proprietary`，不能将本项目或 `vendor/` 资源默认视为可自由再分发。
 

@@ -38,6 +38,11 @@ public:
         const auto calibration_dir = std::getenv("SHARPA_MANUS_CALIBRATION_DIR");
         calibration_dir_ = declare_parameter<std::string>(
             "calibration_dir", calibration_dir == nullptr ? "" : calibration_dir);
+        calibration_operator_ = declare_parameter<std::string>("calibration_operator", "");
+        if (calibration_operator_ == "." || calibration_operator_ == ".." ||
+            calibration_operator_.find('/') != std::string::npos) {
+            throw std::invalid_argument("calibration_operator must be a name, not a path");
+        }
         if (calibration_dir_.empty()) {
             throw std::invalid_argument(
                 "calibration_dir is empty; set SHARPA_MANUS_CALIBRATION_DIR or the "
@@ -148,9 +153,15 @@ private:
     };
 
     std::vector<unsigned char> read_calibration(const std::string& side) {
-        const auto path = std::filesystem::path(calibration_dir_) / ("Calibration_" + side + ".mcal");
+        const auto filename = calibration_operator_.empty()
+            ? "Calibration_" + side + ".mcal"
+            : calibration_operator_ + (side == "left" ? "Left" : "Right") + "MetaglovePro.mcal";
+        const auto path = std::filesystem::path(calibration_dir_) / filename;
         std::ifstream stream(path, std::ios::binary | std::ios::ate);
         if (!stream) {
+            if (!calibration_operator_.empty()) {
+                throw std::runtime_error("Cannot read operator calibration: " + path.string());
+            }
             RCLCPP_WARN(get_logger(), "No readable calibration file %s; retaining SDK calibration", path.c_str());
             return {};
         }
@@ -239,6 +250,7 @@ private:
     std::vector<SkeletonNode> nodes_;
     std::mutex skeleton_mutex_;
     std::string calibration_dir_;
+    std::string calibration_operator_;
     std::atomic<bool> accepting_{false};
     bool initialized_ = false;
 };
