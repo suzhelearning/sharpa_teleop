@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import importlib
 import math
 import os
@@ -48,7 +47,6 @@ class _SideState:
     last_receipt_monotonic: float | None = None
     last_sent: tuple[float, ...] | None = None
     last_send_monotonic: float | None = None
-    samples: deque[tuple[int, tuple[float, ...]]] = field(default_factory=lambda: deque(maxlen=512))
 
 
 def _resolve_upstream_root(sdk_root: str) -> Path:
@@ -404,7 +402,6 @@ class SharpaOutput(Node):
         self.declare_parameter("future_tolerance_sec", 0.0)
         self.declare_parameter("max_velocity", 1.0)
         self.declare_parameter("control_hz", 500.0)
-        self.declare_parameter("buffer_delay_sec", 0.08)
         self.declare_parameter("feedback_hz", 30.0)
         self.declare_parameter("startup_timeout_sec", 5.0)
         self.declare_parameter("auto_enable", False)
@@ -419,7 +416,6 @@ class SharpaOutput(Node):
         self._future_tolerance_sec = 0.0
         self._max_velocity = 1.0
         self._control_hz = 500.0
-        self._buffer_delay_sec = 0.08
         self._feedback_hz = 30.0
         self._startup_timeout_sec = 5.0
         self._hardware_sides: tuple[str, ...] = ()
@@ -444,7 +440,6 @@ class SharpaOutput(Node):
             self._future_tolerance_sec = float(self.get_parameter("future_tolerance_sec").value)
             self._max_velocity = float(self.get_parameter("max_velocity").value)
             self._control_hz = float(self.get_parameter("control_hz").value)
-            self._buffer_delay_sec = float(self.get_parameter("buffer_delay_sec").value)
             self._feedback_hz = float(self.get_parameter("feedback_hz").value)
             self._startup_timeout_sec = float(self.get_parameter("startup_timeout_sec").value)
             auto_enable = self.get_parameter("auto_enable").value
@@ -557,8 +552,6 @@ class SharpaOutput(Node):
         for name, value in positive.items():
             if not math.isfinite(value) or value <= 0.0:
                 raise ValueError(f"{name} must be finite and positive")
-        if not math.isfinite(self._buffer_delay_sec) or not 0.0 < self._buffer_delay_sec < self._timeout_sec:
-            raise ValueError("buffer_delay_sec must be positive and smaller than timeout_sec")
         if not math.isfinite(self._future_tolerance_sec) or self._future_tolerance_sec < 0.0:
             raise ValueError("future_tolerance_sec must be finite and non-negative")
         if not math.isfinite(self._feedback_hz) or self._feedback_hz < 0.0:
@@ -612,10 +605,6 @@ class SharpaOutput(Node):
             if not validation.accepted:
                 self.get_logger().warning(f"Rejected {side} command: {validation.reason}")
                 return
-            if (state.last_receipt_monotonic is not None
-                    and receipt_monotonic - state.last_receipt_monotonic > self._timeout_sec):
-                state.samples.clear()
-            state.samples.append((stamp_ns, validation.positions))
             state.target = validation.positions
             state.last_header_stamp_ns = stamp_ns
             state.last_receipt_monotonic = receipt_monotonic
@@ -628,23 +617,6 @@ class SharpaOutput(Node):
         target.position = list(validation.positions)
         self._target_publishers[side].publish(target)
 
-    def _interpolated_targets(self, sides: Mapping[str, tuple[float, ...]]) -> dict[str, tuple[float, ...]]:
-        """Sample only bracketed source-time trajectories; underruns hold the last sent pose."""
-        sample_ns = self.get_clock().now().nanoseconds - round(self._buffer_delay_sec * 1_000_000_000)
-        result = {}
-        with self._target_lock:
-            for side in sides:
-                samples = self._states[side].samples
-                while len(samples) > 2 and samples[1][0] <= sample_ns:
-                    samples.popleft()
-                if len(samples) < 2:
-                    continue
-                (start_ns, start), (end_ns, end) = samples[0], samples[1]
-                if not start_ns <= sample_ns <= end_ns:
-                    continue
-                alpha = (sample_ns - start_ns) / (end_ns - start_ns)
-                result[side] = tuple(a + alpha * (b - a) for a, b in zip(start, end))
-        return result
 
     def _on_enable(self, request: SetBool.Request, response: SetBool.Response) -> SetBool.Response:
         with self._lock:
@@ -736,7 +708,7 @@ class SharpaOutput(Node):
                 return
 
             try:
-                for side, target in self._interpolated_targets(targets).items():
+                for side, target in targets.items():
                     state = self._states[side]
                     if state.last_sent is None:
                         raise SdkFailure(f"{side} hand has no measured arm position")
@@ -744,9 +716,10 @@ class SharpaOutput(Node):
                     elapsed = 0.0 if previous_send is None else max(0.0, now_monotonic - previous_send)
                     max_step = self._max_velocity * min(elapsed, 1.0 / self._control_hz)
                     next_position = slew_toward(state.last_sent, target, max_step)
-                    if next_position != state.last_sent:
-                        self._backend.set_positions(side, next_position)
-                        state.last_sent = next_position
+                    # Stream each control tick, including a reached target.
+                    # Only incoming commands refresh the input watchdog.
+                    self._backend.set_positions(side, next_position)
+                    state.last_sent = next_position
                     state.last_send_monotonic = now_monotonic
             except (SdkFailure, ValueError) as exc:
                 self._trip(f"hardware command failed: {exc}")
@@ -872,7 +845,11 @@ def main(args: list[str] | None = None) -> None:
     try:
         node = SharpaOutput()
         executor.add_node(node)
-        executor.spin()
+        while rclpy.ok():
+            executor.spin_once()
+            # Let dispatched workers run before polling another ready 2 ms timer.
+            # Otherwise the polling thread can starve them while holding the GIL.
+            time.sleep(0.0001)
     except KeyboardInterrupt:
         graceful_exit = True
     finally:

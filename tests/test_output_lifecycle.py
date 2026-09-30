@@ -184,6 +184,68 @@ class OutputLifecycleTests(unittest.TestCase):
             "sharpa_teleop.sharpa_output.time.sleep", clock.sleep
         )
 
+    def test_latest_target_moves_without_waiting_for_a_second_sample(self):
+        clock = FakeMonotonicClock()
+        backend = FakeLifecycleBackend(clock, initial_position=0.3)
+        output = self._new_output(backend, control_hz=500.0)
+        monotonic, sleep = self._clock_patch(clock)
+        with monotonic, sleep:
+            self._send_fresh_left_target(output, 0.8)
+            self.assertTrue(self._request_enable(output, True).success)
+            for tick in range(1, 6):
+                clock.now = tick * 0.002
+                output._on_control_timer()
+            self.assertEqual(len(backend.set_commands), 5)
+            for tick, (_, positions) in enumerate(backend.set_commands, 1):
+                for position in positions:
+                    self.assertAlmostEqual(position, 0.3 + tick * 0.002)
+
+            # Two targets arrive between ticks: only the latest may execute.
+            self._send_fresh_left_target(output, 0.9)
+            self._send_fresh_left_target(output, -0.2)
+            clock.now += 0.002
+            output._on_control_timer()
+            for position in backend.set_commands[-1][1]:
+                self.assertAlmostEqual(position, 0.308)
+
+    def test_reached_target_streaming_does_not_refresh_input_watchdog(self):
+        clock = FakeMonotonicClock()
+        backend = FakeLifecycleBackend(clock, initial_position=0.3)
+        output = self._new_output(backend, control_hz=500.0)
+        monotonic, sleep = self._clock_patch(clock)
+        with monotonic, sleep:
+            self._send_fresh_left_target(output, 0.303)
+            self.assertTrue(self._request_enable(output, True).success)
+            for tick in range(1, 5):
+                clock.now = tick * 0.002
+                output._on_control_timer()
+            self.assertEqual(len(backend.set_commands), 4)
+            for (_, positions), expected in zip(backend.set_commands, (0.302, 0.303, 0.303, 0.303)):
+                for position in positions:
+                    self.assertAlmostEqual(position, expected)
+            clock.now = 0.501
+            output._on_control_timer()
+            self.assertEqual(len(backend.set_commands), 4)
+            self.assertFalse(backend.enabled)
+            self.assertGreater(backend.disable_calls, 0)
+            self._send_fresh_left_target(output, 0.4)
+            output._on_control_timer()
+            self.assertEqual(backend.arm_calls, 1)
+            self.assertEqual(len(backend.set_commands), 4)
+
+    def test_delayed_control_tick_cannot_cause_a_large_catchup_step(self):
+        clock = FakeMonotonicClock()
+        backend = FakeLifecycleBackend(clock, initial_position=0.3)
+        output = self._new_output(backend, control_hz=500.0)
+        monotonic, sleep = self._clock_patch(clock)
+        with monotonic, sleep:
+            self._send_fresh_left_target(output, 0.8)
+            self.assertTrue(self._request_enable(output, True).success)
+            clock.now = 0.1
+            output._on_control_timer()
+            for position in backend.set_commands[-1][1]:
+                self.assertAlmostEqual(position, 0.302)
+
 
     def test_auto_enable_waits_for_fresh_selected_target_and_arms_once(self):
         clock = FakeMonotonicClock()

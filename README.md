@@ -40,7 +40,7 @@ MuJoCo 反馈                                  已选定的真实机械手
 - [Sharpa Manus SDK](https://github.com/sharpa-robotics/sharpa-manus-sdk) 保持在项目外部：其 `client/ManusSDK` 的授权头文件和库只在构建/运行时被包含和链接，操作者标定文件也从外部 `client` 目录（或 `calibration_dir`）读取。本项目不会复制、暂存或重新授权这些 SDK/标定资源。
 - 真机另需与设备固件兼容的 **Sharpa Wave SDK**。默认路径为 `/opt/sharpa-wave-sdk`；可通过 `SHARPA_WAVE_SDK` 或 `native_sdk_root` 指定。项目不会自动回退到 Manus 仓库附带的旧硬件 SDK。
 - 关节遥操作连接使用 `SharpaWaveConfig.disable_sync_time=true` 和 `disable_tactile=true`，关闭 SDK 启动时的 HTTPS 设备校时和触觉初始化；安全时效检查仍使用电脑侧 ROS 时间戳和单调时钟。关节控制、限位、断流保护及退出回零逻辑不变。
-- 真机输出以 `control_hz=500.0`（2 ms）对带时间戳的关节轨迹做线性插值，再应用 `max_velocity=1.0` rad/s 限速；反馈发布仍为 30 Hz。`sharpa_output.buffer_delay_sec=0.08` 是相对于输入源时间的总延迟，包含前级缓冲及求解耗时，不是再额外增加 80 ms。缺少前后两帧时保持最后下发位置，不外推；输入断流仍触发停止。500 Hz 是主机侧循环目标，并非硬件伺服或网络发包频率保证。
+- 真机输出使用“最新目标 + 500 Hz 在线限速跟随”：`control_hz=500.0`（2 ms）循环从上次下发位置朝最新目标推进，单步不超过 `max_velocity / control_hz`（默认 0.002 rad），也不超过实际经过时间允许的位移；到达目标不超调。新目标立即替换旧目标，不等待第二帧、不排队回放历史轨迹。到达目标后仍每周期下发；只有新收到的有效命令刷新 500 ms Watchdog。已移除输出层 `buffer_delay_sec`，前级 `manus_input` 的 40 ms 缓冲不变；反馈仍为 30 Hz。这里仅限制速度，未引入加速度或 jerk 规划；500 Hz 是主机侧循环目标，不是硬件伺服、实际网络发包频率或硬实时保证。
 - 仿真和真机接收关节目标时，按各关节 URDF 上下限裁剪有限角度，再进入各自的目标处理流程；例如 `-0.52559` 在下限为 `-0.5236` 时裁剪为 `-0.5236` rad。NaN/Inf、名称或数量错误、过期、未来及乱序时间戳仍拒收。硬件实测位置和最终 SDK 下发边界仍严格检查限位，不裁剪反馈来掩盖异常；断流保护和限速不变。
 - `sim` 另需 Sharpa 模型仓库中的 `wave_01` URDF、MuJoCo XML 和网格。`real` 的输出消费者在运行时**不需要**模型仓库或 MuJoCo。
 - 真手套采集需要有效的 **Manus SDK-component 许可证**、已连接的手套及操作者标定文件。
@@ -281,6 +281,7 @@ pixi run ros2 topic echo /sim/sharpa/left/joint_states --qos-reliability best_ef
 | `sharpa_output` | `homing_timeout_sec` / `homing_tolerance_rad` | `10.0` / `0.02` | 回零总时限与实测收敛容差（rad） |
 | `sharpa_output` | `timeout_sec` | `0.5` | 源时间和本地接收时间的有效时限 |
 | `sharpa_output` | `max_velocity` | `1.0` | 每关节指令速度上限，rad/s |
+| `sharpa_output` | `control_hz` / `feedback_hz` | `500.0` / `30.0` | 最新目标限速下发循环与实测反馈频率 |
 | `mujoco_sim` | `timeout_sec` / `feedback_hz` | `0.5` / `30` | 断流保持时限与反馈发布频率 |
 
 ### Launch 参数
@@ -352,9 +353,16 @@ tests/                           安全、重定向、仿真和输出生命周�
 
 ## 验证范围与已知限制
 
+最新目标输出层的离线验证：
+
+- `pixi run test` 通过，当前 Python 回归测试 27 项。输出插值测试随旧实现删除；新增覆盖单帧即可启动跟随、最新目标反向替换、到达目标后持续下发但不刷新 Watchdog、调度延误不产生追赶大步。
+- 在隔离 ROS 域 119 中，用约 **102.56 Hz** 的非等间隔合成关节目标驱动真实 ROS 输出节点 30 秒；硬件接口替换为零 I/O 延时的记录后端，未加载原生 SDK、未连接或使能真机。左右记录接口调用均约 **499.73 Hz**，首次输入到首个运动指令约 **3.11 / 3.12 ms**；单步最大 **0.002 rad**。间隔 P99 为 **2.46 / 2.47 ms**，最大约 **13.32 ms**，不是硬实时保证。
+- 停止输入后约 **501.27 ms** 停用，之后不再下发。结果保存于本地 `build/speedtest-results/latest_follow_500hz.json` 和对应 `.npz`；这些数据验证主机输出逻辑，不代表真机网络时序或电机响应。
+- 本机直接使用多线程执行器 `spin()` 时，曾出现回调调度饥饿及提前断流。保留双线程隔离 SDK 调用与输入回调，改为每次 `spin_once()` 分发后让出 100 μs；上述持续测试使用此调度方式，不靠放宽 Watchdog 达标。
+
 当前加速后端的离线验证：
 
-- `pixi install -e retarget`、`pixi run build`、`pixi run test` 通过，Python 回归测试 28 项。
+- 此前 `pixi install -e retarget`、`pixi run build` 和当时的 28 项 Python 回归测试通过；当前测试结果见上述输出层验证。
 - 默认输入为 250 Hz，源时间缓冲仍为 40 ms。在隔离 ROS 域 107 中，将 `SpeedTest-250hz.HDF5` 的 2,477 帧/手循环回放 3 遍，预热后测量约 30 秒。左右手各收到并输出 7,431 帧，无丢帧、无重复源时间戳，实际输出为 **250.025 / 250.024 Hz**。
 - `/poses` 发布到 `/command` 接收的中位延迟为 **4.01 / 4.18 ms**，P99 为 **9.38 / 9.88 ms**；这些数值不包含前级 40 ms 缓冲。输出间隔 P99 为 **6.23 / 6.06 ms**，最大 **16.28 / 16.47 ms**。这是持续平均 250 Hz，不是硬实时每 4 ms 必达的保证。
 - 该次全部 7,431 帧/手均为有限值、源时间递增、关节名称与 URDF 顺序匹配，原始结果已在关节限位内，无须裁剪。相对原算法按相同录制帧对齐、排除最初 50 帧后，轨迹 RMSE 为 **8.11° / 6.68°**，最大关节差异 **47.58° / 36.52°**。消除历史运动项后的静态目标函数均值约增加 **3.13% / 4.03%**，不能将提频称为无损优化。

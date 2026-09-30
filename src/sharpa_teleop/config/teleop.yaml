@@ -29,6 +29,5 @@ sharpa_output:
     future_tolerance_sec: 0.0
     max_velocity: 1.0  # radians/second per joint, starts from measured pose
     control_hz: 500.0
-    buffer_delay_sec: 0.08  # Total source-time lag, including input buffering and retargeting
     feedback_hz: 30.0
     startup_timeout_sec: 5.0
