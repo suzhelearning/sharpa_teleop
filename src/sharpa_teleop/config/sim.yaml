@@ -1,5 +1,5 @@
 # Simulation-only launch; no sharpa_output node or hardware SDK is started.
-# MuJoCo XML and meshes stay in the external SHARPA_MODELS checkout.
+# MuJoCo XML and meshes are selected through SHARPA_MODELS.
 # Finger dynamics/position gains are retained; untracked wrists/head are fixed.
 mujoco_sim:
   ros__parameters:

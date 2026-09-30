@@ -1,4 +1,4 @@
-"""Retarget native Manus PoseArrays through the external Python 3.10 worker."""
+"""Retarget native Manus PoseArrays through the isolated Python 3.10 worker."""
 
 from __future__ import annotations
 from collections import deque

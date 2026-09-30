@@ -589,6 +589,9 @@ environments:
       - conda: https://prefix.dev/robostack-jazzy/linux-64/ros2-visualization-msgs-5.3.8-np2py312h2ed9cc7_21.conda
       - conda: https://prefix.dev/robostack-jazzy/linux-64/ros2-yaml-cpp-vendor-9.0.1-np2py312h2ed9cc7_21.conda
       - conda: https://prefix.dev/robostack-jazzy/linux-64/ros2-zstd-vendor-0.26.11-np2py312h2ed9cc7_21.conda
+      - pypi: ./vendor/sharpa_teleop_manus_resources-4.0.0-py3-none-linux_x86_64.whl
+      - pypi: ./vendor/sharpa_teleop_model_resources-1.0.0-py3-none-linux_x86_64.whl
+      - pypi: ./vendor/sharpa_teleop_wave_resources-5.0.11-py3-none-linux_x86_64.whl
       - pypi: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/58/0a/a10b45aab35b175aded078a462dc8d0c698f5b13946e7cb0869097b78bb6/absl_py-2.5.0-py3-none-any.whl
       - pypi: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/5a/3d/589663aeeacd59bb2f3e8596bfd3e81cf0fb18d70bb433199041f469771b/etils-1.14.0-py3-none-any.whl
       - pypi: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/63/1e/3566513720a4f424558bc9a810f6d9e38b57fd8a1162df532cd7262d5933/mujoco-3.3.6-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl
@@ -12097,6 +12100,15 @@ packages:
   run_exports: {}
   size: 24252
   timestamp: 1788258615828
+- pypi: ./vendor/sharpa_teleop_manus_resources-4.0.0-py3-none-linux_x86_64.whl
+  name: sharpa-teleop-manus-resources
+  version: 4.0.0
+- pypi: ./vendor/sharpa_teleop_model_resources-1.0.0-py3-none-linux_x86_64.whl
+  name: sharpa-teleop-model-resources
+  version: 1.0.0
+- pypi: ./vendor/sharpa_teleop_wave_resources-5.0.11-py3-none-linux_x86_64.whl
+  name: sharpa-teleop-wave-resources
+  version: 5.0.11
 - pypi: https://files.pythonhosted.org/packages/3a/13/547360d81e6d88d58492968ffda9f9542854f11310ee556fef14260cc886/zipp-4.1.0-py3-none-any.whl
   name: zipp
   version: 4.1.0

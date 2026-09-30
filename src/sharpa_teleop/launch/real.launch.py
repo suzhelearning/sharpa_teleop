@@ -15,7 +15,7 @@ def generate_launch_description():
     defaults = {
         "config": os.path.join(get_package_share_directory("sharpa_teleop"), "config", "teleop.yaml"),
         "sdk_root": os.environ.get("SHARPA_MANUS_SDK", ""),
-        "native_sdk_root": os.environ.get("SHARPA_WAVE_SDK", "/opt/sharpa-wave-sdk"),
+        "native_sdk_root": os.environ.get("SHARPA_WAVE_SDK", ""),
         "dry_run": "false",
         "auto_enable": "true",
         "return_to_zero_on_exit": "true",

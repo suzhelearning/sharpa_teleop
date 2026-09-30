@@ -8,7 +8,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src/sharpa_teleop"
 from sharpa_teleop.sim_model import HandSimulation
 
 
-@unittest.skipUnless(os.environ.get("SHARPA_MODELS"), "requires external Sharpa model checkout")
+@unittest.skipUnless(os.environ.get("SHARPA_MODELS"), "requires Sharpa model resources")
 class SimulationTests(unittest.TestCase):
     def test_bilateral_targets_drive_the_correct_physical_joints(self):
         sim = HandSimulation(os.environ["SHARPA_MODELS"])

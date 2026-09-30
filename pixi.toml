@@ -32,12 +32,17 @@ pyyaml = "*"
 
 [pypi-dependencies]
 mujoco = "==3.3.6"
+sharpa-teleop-manus-resources = { path = "vendor/sharpa_teleop_manus_resources-4.0.0-py3-none-linux_x86_64.whl" }
+sharpa-teleop-model-resources = { path = "vendor/sharpa_teleop_model_resources-1.0.0-py3-none-linux_x86_64.whl" }
+sharpa-teleop-wave-resources = { path = "vendor/sharpa_teleop_wave_resources-5.0.11-py3-none-linux_x86_64.whl" }
 
 [activation.env]
 ROS_DOMAIN_ID = "42"
 RETARGET_PYTHON = "$PIXI_PROJECT_ROOT/.pixi/envs/retarget/bin/python"
-SHARPA_MANUS_SDK = "$PIXI_PROJECT_ROOT/../sharpa-manus-sdk"
-SHARPA_MODELS = "$PIXI_PROJECT_ROOT/../sharpa-urdf-usd-xml"
+SHARPA_MANUS_SDK = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/python3.12/site-packages/sharpa_teleop_manus_resources"
+SHARPA_MODELS = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/python3.12/site-packages/sharpa_teleop_model_resources"
+SHARPA_WAVE_SDK = "$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/python3.12/site-packages/sharpa_teleop_wave_resources"
+SHARPA_MANUS_CALIBRATION_DIR = "$PIXI_PROJECT_ROOT/calibration"
 
 [tasks]
 build = "python scripts/workspace.py build"
@@ -51,6 +56,7 @@ doctor = "python scripts/workspace.py doctor"
 test = "python -m unittest discover -s tests -v"
 record-speed-test = "python scripts/record_speed_test.py"
 help = "python scripts/workspace.py --help"
+package-vendor = "python scripts/package_vendor.py"
 
 [feature.retarget]
 channels = ["conda-forge"]

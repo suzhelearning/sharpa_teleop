@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run the project-native Manus ROS producer without copying the SDK."""
+"""Build and run the project-native Manus ROS producer with the selected SDK."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ BINARY = BUILD_DIR / "manus_ros"
 
 def _sdk_root(value: str) -> Path:
     if not value.strip():
-        raise SystemExit("Set SHARPA_MANUS_SDK to your authorized sharpa-manus-sdk checkout.")
+        raise SystemExit("Set SHARPA_MANUS_SDK to an authorized sharpa-manus-sdk directory.")
     root = Path(value).expanduser().resolve()
     manus_sdk = root / "client" / "ManusSDK"
     if not (
@@ -58,15 +58,20 @@ def _build(manus_sdk: Path) -> None:
     subprocess.run(["cmake", "--build", str(BUILD_DIR), "--parallel", "2"], cwd=ROOT, check=True)
 
 
-def _calibration_dir(value: str, sdk_root: Path) -> Path:
-    calibration_dir = Path(value).expanduser().resolve() if value.strip() else sdk_root / "client"
+def _calibration_dir(value: str) -> Path:
+    if not value.strip():
+        raise SystemExit(
+            "Set SHARPA_MANUS_CALIBRATION_DIR or pass --calibration-dir with an "
+            "operator calibration directory."
+        )
+    calibration_dir = Path(value).expanduser().resolve()
     if not calibration_dir.is_dir():
         raise SystemExit(f"Missing Manus calibration directory: {calibration_dir}")
     return calibration_dir
 
 
 def _set_runtime_library_path(manus_sdk: Path) -> None:
-    """Make the launch sdk_root select the matching external SDK library."""
+    """Make the launch sdk_root select the matching SDK library."""
     library_dir = str(manus_sdk / "lib")
     existing = os.environ.get("LD_LIBRARY_PATH", "")
     os.environ["LD_LIBRARY_PATH"] = (
@@ -74,11 +79,13 @@ def _set_runtime_library_path(manus_sdk: Path) -> None:
     )
 
 
-def _native_ros_arguments(arguments: list[str], calibration_dir: Path) -> list[str]:
+def _native_ros_arguments(arguments: list[str], calibration_dir: Path | None) -> list[str]:
     if arguments and arguments[0] != "--ros-args":
         raise SystemExit("Native arguments must begin with --ros-args.")
     ros_arguments = list(arguments) or ["--ros-args"]
-    if not any("calibration_dir:=" in argument for argument in ros_arguments):
+    if calibration_dir is not None and not any(
+        argument.startswith("calibration_dir:=") for argument in ros_arguments
+    ):
         ros_arguments.extend(["-p", f"calibration_dir:={calibration_dir}"])
     return ros_arguments
 
@@ -95,8 +102,8 @@ def main() -> None:
     parser.add_argument("--sdk-root", default=os.environ.get("SHARPA_MANUS_SDK", ""))
     parser.add_argument(
         "--calibration-dir",
-        default="",
-        help="external calibration directory; defaults to <sdk-root>/client",
+        default=os.environ.get("SHARPA_MANUS_CALIBRATION_DIR", ""),
+        help="operator calibration directory; defaults to SHARPA_MANUS_CALIBRATION_DIR",
     )
     args, native_arguments = parser.parse_known_args()
     sdk_root = _sdk_root(args.sdk_root)
@@ -107,7 +114,11 @@ def main() -> None:
 
     if not BINARY.is_file():
         raise SystemExit("Build first: pixi run manus-build")
-    calibration_dir = _calibration_dir(args.calibration_dir, sdk_root)
+    calibration_dir = (
+        None
+        if any(argument.startswith("calibration_dir:=") for argument in native_arguments)
+        else _calibration_dir(args.calibration_dir)
+    )
     _set_runtime_library_path(manus_sdk)
     os.execv(str(BINARY), [str(BINARY), *_native_ros_arguments(native_arguments, calibration_dir)])
 

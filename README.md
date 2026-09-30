@@ -1,488 +1,448 @@
 # Sharpa Teleop
 
-基于 **Pixi + ROS 2 Jazzy** 的 Manus 手套遥操作项目。基于官方 Sharpa 运动学模型与目标函数，将双手关键点转换为 SharpaWave 关节目标；同一套生产者可接入 **MuJoCo 仿真** 或 **真实机械手安全输出**。
+将 **Manus 数据手套**的双手动作转换为 **SharpaWave 灵巧手**关节目标，并通过 **MuJoCo 仿真**或**真实机械手**观察和执行。
 
-> 标准拓扑固定为两个终端：终端 1 运行唯一生产者 `pixi run manus`，终端 2 选择**一个**消费者：`pixi run sim` 或 `pixi run real [left|right]`。`real` 默认双手，直接消费重定向目标；它不启动 MuJoCo。软件保护不能替代实体急停。
+项目使用 **Pixi** 管理依赖、**ROS 2 Jazzy** 传递数据：每手 25 个关键点输入，经官方运动学模型、目标函数与原版 IPOPT 求解器转换为每手 22 个关节角，双手共 44 个关节。目前不跟踪腕部或头部位姿。
+
+> **真机安全须知：** `pixi run real` 默认连接真实设备，并在收到所选手的有效目标后自动使能。当前没有输入超时停用机制，也没有固定速度上限；停止手套或重定向进程后，机械手仍会接近并保持最后目标。软件保护不能替代实体急停。
 
 ## 数据链路
 
 ```text
-终端 1：pixi run manus（唯一生产者组）
+终端 1：pixi run manus
+
 Manus 手套
-  │ 本项目原生 C++ `manus_ros`（直接 Manus SDK）
-  ▼
-/manus/{left,right}/raw_poses（原始采集频率，每手 25 个关键点）
-  │ retarget（直接订阅，官方模型、目标函数与原版 IPOPT）
-  ▼
-/sharpa/{left,right}/command（22 个关节，rad；保留输入时间戳）
-  ├─────────────────────────────────────────────────────┐
-  │                                                     │
-  ▼                                                     ▼
-终端 2：pixi run sim                         终端 2：pixi run real [left|right]
-mujoco_sim                                  sharpa_output
-  │ 500 Hz 指数平滑 → 位置执行器             │ 500 Hz 指数平滑 → 原生 SDK
-  ▼                                           ▼
-MuJoCo 反馈                                  已选定的真实机械手
+    │ 本项目原生 C++ 适配器，直接调用 Manus SDK
+    ▼
+/manus/{left,right}/raw_poses       每手 25 个关键点
+    │ retarget → 独立 Python 3.10 工作进程 → 官方 IPOPT
+    ▼
+/sharpa/{left,right}/command       每手 22 个关节目标，rad
+    │
+    ├── 终端 2：pixi run sim
+    │       最新目标 → 指数平滑 → MuJoCo 位置执行器
+    │       反馈：/sim/sharpa/{left,right}/joint_states
+    │
+    └── 终端 2：pixi run real [left|right]
+            最新目标 → 指数平滑 → Sharpa Wave SDK
+            反馈：/sharpa/{left,right}/joint_states
 ```
 
-`manus.launch.py` 只启动项目本地 `manus_ros` 和 `retarget`。Manus 每次真实采集回调直接发布原始位姿，不再经过 250 Hz 重采样或 40 ms 插值缓冲；重定向直接消费原始话题。项目运行路径中没有中间网络帧转发或伪终端。生产者组内任一已启动进程退出，launch 会关闭该组。`sim` 和 `real` 是独立的最新目标消费者，不启动输入或重定向，也不串联。
+标准工作流是 **一个生产者 + 一个消费者**，第二个终端选择 `sim` 或 `real`：
 
-仿真只发布 `/sim/sharpa/{left,right}/joint_states` 反馈；真实输出直接订阅 `/sharpa/{left,right}/command`。不要在同一 ROS 域把 `sim` 和 `real` 当作同一条链路的两个阶段运行。
+- `manus` 只启动采集与重定向。组内任一已启动进程退出，launch 会关闭该组。
+- `sim`、`real` 独立消费关节命令，不启动采集或重定向，也不串联。
+- `real` 不启动 MuJoCo，不读取仿真关节状态。
+- Manus 按 SDK 实际采集回调发布，重定向直接订阅原始话题，没有中间重采样、插值缓冲或网络帧转发。
+- 重定向保留输入时间戳，并等待官方求解完成后才发布结果；过载时不保证每个输入都有输出。
 
-## 环境与外部依赖
+## 环境与随仓库资源
 
-- Linux x86-64；当前验证环境为 Ubuntu 24.04。
-- 已安装 [Pixi](https://pixi.sh/)。ROS 2 Jazzy 和 `manus_ros` 所需的 C++ 工具链通过默认 Pixi 环境提供，不要求系统预装 ROS。
-- `native/manus_ros` 是本项目的本地 C++ 适配器：它直接调用 Manus SDK 并发布 ROS 2 `PoseArray`，不需要客户端专用 Pixi 环境、终端伪设备或网络帧转发。
-- [Sharpa Manus SDK](https://github.com/sharpa-robotics/sharpa-manus-sdk) 保持在项目外部：其 `client/ManusSDK` 的授权头文件和库只在构建/运行时被包含和链接，操作者标定文件也从外部 `client` 目录（或 `calibration_dir`）读取。本项目不会复制、暂存或重新授权这些 SDK/标定资源。
-- 真机另需与设备固件兼容的 **Sharpa Wave SDK**。默认路径为 `/opt/sharpa-wave-sdk`；可通过 `SHARPA_WAVE_SDK` 或 `native_sdk_root` 指定。项目不会自动回退到 Manus 仓库附带的旧硬件 SDK。
-- 关节遥操作连接使用 `SharpaWaveConfig.disable_sync_time=true` 和 `disable_tactile=true`，关闭 SDK 启动时的 HTTPS 设备校时和触觉初始化；保留关节限位、格式校验、SDK 故障停用及健康退出回零。
-- 仿真和真机统一使用“最新目标 + 500 Hz 指数平滑”：`q_next = q_prev + (1 - exp(-dt / tau)) * (target - q_prev)`，默认 `tau = smoothing_time_sec = 0.02` 秒，`dt` 为实际经过的单调时间。新目标立即替换旧目标，不回放历史轨迹；两端使用同一函数，不限制固定速度、步长、加速度或 jerk。20 ms 时间常数约需 60 ms 接近目标变化量的 95%；大角度变化会产生较大速度，不能当作安全限速。
-- **已删除 1 rad/s 限速和 500 ms 输入 Watchdog。** 输入断流后，仿真与真机会继续接近最后一个有效目标并持续保持；不会因消息年龄停用，旧但首次收到且格式有效的递增时间戳目标也可接受。不要依赖停止手套输入来停止机械手，必须显式停用、退出输出进程或使用实体急停。500 Hz 是主机侧循环目标，不是硬件伺服、网络发包频率或硬实时保证。
-- 输入目标仍按 URDF 上下限裁剪；NaN/Inf、名称或数量错误、未来及乱序时间戳仍拒收。实测反馈和最终 SDK 下发边界严格检查限位，SDK 故障仍触发停用。`rawmanus` 的过期标签仅用于显示，不会控制机械手。
-- `sim` 另需 Sharpa 模型仓库中的 `wave_01` URDF、MuJoCo XML 和网格。`real` 的输出消费者在运行时**不需要**模型仓库或 MuJoCo。
-- 真手套采集需要有效的 **Manus SDK-component 许可证**、已连接的手套及操作者标定文件。
-- 只有 MuJoCo 窗口需要图形显示环境；无显示器时给 `sim` 传入 `headless:=true`。
+### 运行要求与资源边界
 
-默认目录布局：
+- **Linux x86-64**；项目已有 Ubuntu 24.04 运行记录。
+- 已安装 [Pixi](https://pixi.sh/)。ROS 2 Jazzy 和 C++ 工具链由 Pixi 提供，不要求系统预装 ROS。
+- 本项目以 `sharpa_teleop/` 为唯一上层目录。克隆本仓库会同时取得 `pixi.toml`、`pixi.lock` 和 `vendor/`；不需要维护兄弟目录、额外克隆 SDK/模型，或将这些资源安装到 `/opt`。
+- `vendor/` 中的三个本地 wheel 包含获授权的 [Sharpa Manus SDK](https://github.com/sharpa-robotics/sharpa-manus-sdk) 采集与 V4.0 重定向资源、[Sharpa Wave URDF/USD/XML](https://github.com/sharpa-robotics/sharpa-urdf-usd-xml) 标准双手模型及网格、[Sharpa Wave SDK](https://github.com/sharpa-robotics/sharpa-wave-sdk) 5.0.11。官方链接用于标明来源，不是额外安装步骤。许可证及 NOTICE 随资源原样保留。
+- 真手套采集仍需要有效的 **Manus SDK-component 许可证**、已连接手套和适合当前操作者的标定。
+- MuJoCo 交互窗口和原始关键点窗口需要图形显示环境；仿真可使用 `headless:=true`。
+
+目录布局：
 
 ```text
-sharpa/
-├── sharpa_teleop/          # 本项目
-├── sharpa-manus-sdk/       # 官方 SDK
-└── sharpa-urdf-usd-xml/    # 官方模型（仅仿真需要）
+sharpa_teleop/
+├── pixi.toml / pixi.lock
+├── vendor/                   # 三个压缩资源 wheel，随仓库分发
+│   ├── sharpa_teleop_manus_resources-4.0.0-py3-none-linux_x86_64.whl
+│   ├── sharpa_teleop_model_resources-1.0.0-py3-none-linux_x86_64.whl
+│   └── sharpa_teleop_wave_resources-5.0.11-py3-none-linux_x86_64.whl
+├── .pixi/envs/               # pixi install 生成，包含解包后的资源
+└── calibration/              # 操作者私有标定，不随仓库分发
 ```
 
-`pixi.toml` 使用项目相对路径设置：
+`pixi.toml` 将这些 wheel 声明为相对路径 PyPI 依赖，`pixi install` 自动解包到项目内 `default` 环境的 `site-packages`；运行入口通过激活变量使用安装后的目录，不需要安装钩子或 Git LFS。原始 Manus 集成库超过 100 MiB，压缩 wheel 避免将该大文件直接提交到 Git。`real` 不加载仿真模型，但会读取已安装 Manus 资源中的关节 URDF。
 
-| 环境变量 | 默认值 | 用途 |
-| --- | --- | --- |
-| `SHARPA_MANUS_SDK` | `$PIXI_PROJECT_ROOT/../sharpa-manus-sdk` | Manus 协议、重定向库、URDF |
-| `SHARPA_MANUS_CALIBRATION_DIR` | 空（使用 `$SHARPA_MANUS_SDK/client`） | Manus 标定文件目录覆盖 |
-| `SHARPA_WAVE_SDK` | `/opt/sharpa-wave-sdk` | 独立机械手 SDK |
-| `SHARPA_MODELS` | `$PIXI_PROJECT_ROOT/../sharpa-urdf-usd-xml` | MuJoCo 模型与网格；仅 `sim` |
-| `RETARGET_PYTHON` | `$PIXI_PROJECT_ROOT/.pixi/envs/retarget/bin/python` | 独立重定向解释器 |
-| `ROS_DOMAIN_ID` | `42` | 默认 ROS 通信域 |
-
-### 为什么使用两个 Pixi 环境？
+### 为什么有两个 Pixi 环境？
 
 | 环境 | Python | 职责 |
 | --- | --- | --- |
-| `default` | 3.12 | ROS 2 Jazzy 节点、MuJoCo，以及构建和运行本地 `manus_ros` |
-| `retarget` | 3.10 | 运行上游重定向库及官方原版 IPOPT 求解器 |
+| `default` | 3.12 | ROS 2 节点、MuJoCo、原生 Manus 适配器构建与运行 |
+| `retarget` | 3.10 | 官方重定向二进制和原版 IPOPT 求解器 |
 
-上游重定向二进制使用 Python 3.10 ABI，不能直接加载到 Jazzy 的 Python 3.12 进程。项目以隔离子进程连接两者，避免 ROS 的 `PYTHONPATH` 污染重定向环境。原生 Manus 适配器与 ROS 节点在同一默认环境中构建和运行，因此可直接发布 ROS 数据。
-
-重定向直接启动官方 SDK 的左右手优化进程，不替换其数值求解器，也不在启动时编译自定义目标函数。工作进程启动后发送 `READY`；每帧仍等待官方求解完成，避免将初始零值或上一帧结果当作新结果发布。
+上游重定向二进制依赖 Python 3.10 ABI，不能直接加载到 Jazzy 的 Python 3.12 进程中。项目通过隔离子进程连接两者，避免 ROS 的 `PYTHONPATH` 污染重定向环境，不替换官方数值求解器。
 
 ## 安装与构建
 
-在项目根目录执行：
+克隆本仓库（含 `vendor/`）后，在唯一的 `sharpa_teleop/` 根目录执行：
 
 ```bash
-# 安装默认与重定向环境，使用项目锁文件中的依赖
-pixi install --all
+# 按 pixi.lock 安装 default 与 retarget 环境；不构建 ROS、不连接设备
+pixi install --all --locked
 
-# 独立构建 ROS 包；sim 和 real 不会触发本地 Manus 适配器构建
+# 构建 ROS 包
 pixi run build
 
-# 可选：单独构建本地 Manus ROS 适配器
+# 仅在使用真手套采集时构建原生 Manus 适配器
 pixi run manus-build
 
-# 检查 ROS、重定向库和 Sharpa SDK 的导入
+# 检查 ROS、重定向库及硬件 SDK 的导入
 pixi run doctor
-
-# 可选：执行回归测试
-pixi run test
 ```
 
-标准手套生产者只有 `pixi run manus`：它依赖并自动执行 `build` 与 `manus-build`，然后启动完整生产者组。`sim` 和 `real` 都不会触发本地 Manus 适配器构建或要求 Manus client 标定文件；`real` 仍按其 `sdk_root` 参数使用外部重定向 URDF。`doctor` 只检查依赖，不代表许可证、手套连接或机械手通信已经就绪。
+不带参数的 `pixi install` 默认只安装 `default`，其中已包含三套资源；要同时准备官方重定向所需的 Python 3.10 `retarget` 环境，请使用 `--all`。`--locked` 要求清单与已提交锁文件一致，不更新锁定依赖。两套 Python 不会被合并，资源 wheel 只安装到 `default`，工作进程按项目内路径读取重定向资源。
 
-本地适配器构建产物为 `build/manus-native/manus_ros`。`scripts/manus_client.py` 以 Release 模式和 `-DMANUS_SDK=<外部 SDK>/client/ManusSDK` 配置 `native/`；不会暂存上游源文件、生成项目内协议桥接代码或修改外部 SDK。旧客户端环境的 CMake 缓存会在首次新配置时刷新。
+`pixi install` 安装环境并解包本地资源，不会自动构建 ROS 或原生适配器，不启动 ROS，不发现、使能或移动设备，也不会下载或验证 Manus 许可证、手套连接或操作者标定。`doctor` 同样不发现、使能或运动设备；导入成功不代表许可证、手套连接、操作者标定或机械手通信就绪。
 
-如需单独启动已构建的适配器，可使用 `pixi run manus-native -- --ros-args -p calibration_dir:=/path/to/calibration`；它是调试入口，不是标准生产者命令。
+常用任务：
 
-更多命令说明：
+| 命令 | 用途 |
+| --- | --- |
+| `pixi run manus` | 构建并启动采集与重定向生产者 |
+| `pixi run sim` | 构建 ROS 包并启动仿真消费者 |
+| `pixi run real [left\|right]` | 构建 ROS 包并启动真机消费者 |
+| `pixi run rawmanus` | 构建并启动原始关键点诊断窗口，默认同时启动采集 |
+| `pixi run manus-build` | 单独构建原生 Manus 适配器 |
+| `pixi run manus-native` | 单独运行原生采集适配器，供低层调试 |
+| `pixi run record-speed-test` | 录制原始位姿和重定向关节目标 |
+| `pixi run test` | 运行现有 Python 回归测试 |
+| `pixi run help` | 查看命令帮助 |
 
-```bash
-pixi run help
-```
+原生适配器以 Release 模式构建，产物为 `build/manus-native/manus_ros`，直接包含和链接 `$SHARPA_MANUS_SDK/client/ManusSDK` 中的已安装资源。`sim`、`real` 不触发原生适配器构建；`rawmanus with_client:=false` 也不构建或校验 Manus SDK。
 
-## 快速开始：两终端工作流
+## 快速开始
 
-### 标准 MuJoCo 仿真
+### 1. 仿真遥操作
 
-终端 1 启动唯一的采集、ROS 桥接和重定向生产者：
+终端 1 启动采集与重定向：
 
 ```bash
 pixi run manus
 ```
 
-终端 2 只启动交互式 MuJoCo 消费者：
+终端 2 启动仿真：
 
 ```bash
 pixi run sim
 ```
 
-`sim` 不启动 `retarget` 或 `sharpa_output`，也不会发现、使能或移动真实机械手。无窗口运行时：
+无窗口运行：
 
 ```bash
 pixi run sim headless:=true
 ```
 
-`sim` 只等待 `/sharpa/{left,right}/command`；它不会生成演示动作。若要低层测试仿真，可由另一个符合接口约束的发布者提供这些命令。
+`sim` 不会发现、使能或移动真实机械手，也不会生成演示动作。尚未收到有效命令时保持初始位置；收到命令后跟随最新有效目标。
 
-### 直接查看 Manus 原始关键点
+仿真加载 `wave_01/dual_sharpa_wave/dual_sharpa_wave.xml`，保留厂商手指动力学、碰撞配置和位置执行器参数，固定未跟踪的腕部及头部自由度。默认物理步长为 `0.002 s`，积分器为 `implicitfast`，窗口同步为 30 Hz。关节和执行器按名称映射，限位使用 URDF、XML 关节及执行器范围的交集。模型资源中的网格路径在内存中解析，不修改资源文件。
 
-排查“人手伸直，但机械手某些手指仍弯曲”时，先绕过重定向：
+### 2. 真机遥操作
 
-```bash
-pixi run rawmanus
-```
+启动前确认：
 
-此命令只启动 Manus 原生采集和三维关键点窗口，不启动重定向、机械手模型或真机输出。窗口直接订阅 `/manus/{left,right}/raw_poses`，每手显示 25 个关键点、编号及按手指着色的骨架连线。“原始”指采集适配器发布的数据：已转换为手根相对坐标并重排关键点顺序，但没有插值、关节求解或滤波。窗口使用 MuJoCo 渲染，不执行动力学。
+1. 机械手固定可靠、工作空间清空，实体急停可用。
+2. 核对左右手对应关系和序列号。
+3. 使用随仓库分发且与设备固件兼容的 Sharpa Wave SDK。
+4. 完全退出其他控制程序，包括 Sharpa 控制软件的托盘后台 `pilot_sdk`，避免占用发现端口 UDP `54321`。
 
-若 `pixi run manus` 已经运行，使用订阅模式，**不要再启动第二个采集客户端**：
-
-```bash
-pixi run rawmanus with_client:=false
-```
-
-- 点 `0` 为手根；拇指 `1–4`（橙）、食指 `5–9`（青）、中指 `10–14`（绿）、无名指 `15–19`（粉）、小指 `20–24`（黄）。
-- 左右手分开展示；显示偏移仅用于排版，不修改 ROS 数据。等待输入、正常更新和数据过期会明确区分，过期骨架不冒充实时姿态。
-- 可用鼠标旋转、缩放视角。关闭窗口或按 Ctrl+C 会退出本次启动的诊断组；订阅模式不会停止已有的外部生产者。
-- 若原始骨架里的无名指、小指已经弯曲，先检查 Manus 佩戴与标定；若原始骨架伸直、重定向后才弯曲，再检查映射与求解。此窗口本身不能证明真机反馈正常。
-
-### 已有外部原始 ROS 发布者
-
-若已有其他进程或主机在同一 ROS 域发布原始位姿，可只启动重定向：
-
-```bash
-pixi run manus with_client:=false
-```
-
-此模式只启动一组 `retarget`，适用于已有原始 ROS 发布者或集成测试。外部发布者必须在 `/manus/{left,right}/raw_poses` 提供每手 25 个有限 `geometry_msgs/PoseArray` 位姿、递增源时间戳，以及固定根相对 `frame_id`：`manus_left_hand` 或 `manus_right_hand`。
-
-### 仿真模型与行为
-
-`sim` 使用外部模型：
-
-```text
-wave_01/dual_sharpa_wave/dual_sharpa_wave.xml
-```
-
-- 从左右手 URDF 读取关节名称和限位，按名称映射 XML 执行器。
-- 保留厂商手指动力学、碰撞配置和位置执行器参数。
-- 双手共 **44 个手指关节**；当前不跟踪腕部或头部位姿，因此固定模型中额外的腕部、头部自由度。
-- 在内存中解析外部网格路径，不修改或复制模型仓库资源。
-- 控制默认 500 Hz，物理步长 `0.002 s`，积分器 `implicitfast`；窗口同步为 30 Hz。回调只替换最新目标，控制周期经 20 ms 时间常数指数平滑后驱动位置执行器。
-- 没有输入超时或速度上限。停止输入后仍接近并保持最后目标；没有目标时保持初始实测位置。
-- 反馈来自实际 MuJoCo `qpos/qvel`，不是目标位置回显。
-- ROS 消息使用墙钟时间戳；目前不发布 `/clock`，不应为这条链路开启 `use_sim_time`。
-
-## 真实机械手输出
-
-> 首次实机运行前，检查机械手固定、工作空间、默认左右手序列号、左右手对应关系和实体急停。完全退出 Sharpa 控制软件（包括托盘后台 `pilot_sdk`），避免占用 SDK 发现端口 UDP `54321`。不要同时运行其他控制机械手的程序。
-
-终端 1 保持唯一生产者：
+终端 1：
 
 ```bash
 pixi run manus
 ```
 
-终端 2 直接将重定向命令送入安全输出：
+终端 2，根据设备选择其中一条：
 
 ```bash
-pixi run real        # 默认双手
-pixi run real left   # 仅左手
-pixi run real right  # 仅右手
+pixi run real         # 双手
+pixi run real left    # 仅左手
+pixi run real right   # 仅右手
 ```
 
-`real` 不启动 MuJoCo，不订阅仿真 `qpos`，也不需要模型仓库或图形显示。它直接订阅 `/sharpa/{left,right}/command`，且不使用仿真显示或模型启动参数。
+命令默认使用以下设备，换设备时必须覆盖：
 
-默认左手 SN 为 `C55C9039C55F`，右手 SN 为 `CC549038CC57`。双手模式等待两侧都有有效目标才自动使能；目标不会随时间过期，任一侧断流也不会停用。单手模式只连接、校验和使能所选侧，忽略另一侧命令。SDK 或反馈异常仍会停用所有已选手。
-
-`real` 默认注入 `dry_run:=false`、`auto_enable:=true` 和 `return_to_zero_on_exit:=true`，并且只为所选侧传入序列号。自动使能只尝试一次；显式停用或故障会取消等待。给未选侧提供非空 SN 是不兼容的，命令会被拒绝。
-
-可覆盖选中侧设备或以安全预览方式调试输出：
+| 侧别 | 默认序列号 |
+| --- | --- |
+| 左手 | `C55C9039C55F` |
+| 右手 | `CC549038CC57` |
 
 ```bash
-# 使用另一套真机 SDK
-pixi run real native_sdk_root:=/opt/sharpa-wave-sdk
-
-# 输出节点的 dry-run 预览：不应移动真机
-pixi run real dry_run:=true
-
-# 只覆盖已选侧的设备
 pixi run real left left_serial:=LEFT_SN
 pixi run real right right_serial:=RIGHT_SN
+# 仅在有意覆盖随仓库 SDK 根目录时使用
+pixi run real native_sdk_root:=/path/to/compatible/sharpa-wave-sdk
 ```
 
-`dry_run:=true` 是当前直接输出路径的调试预览。`real` 不会生成空的 `<arg>:=` 覆盖；需要自定义序列号时只传入选中侧。
+默认硬件 SDK 根目录由 `SHARPA_WAVE_SDK` 指向项目内已安装的 Wave 资源；普通克隆不需要 `/opt` 安装。
 
-正常 Ctrl+C 或 SIGTERM 时，健康且已使能的输出使用相同指数平滑回到 `0 rad`，实测位置进入回零容差后停用；不再按 1 rad/s 限速。回零总时限与 SDK 发现/通信故障处理仍保留，它们不是输入 Watchdog。故障、SIGKILL、掉电或 SDK 阻塞时不能保证回零，故障后不会自动重新使能。
+`real` 默认设置 `dry_run:=false`、`auto_enable:=true`、`return_to_zero_on_exit:=true`。双手模式等待两侧都有有效目标；单手模式只连接、校验并使能所选侧，忽略另一侧命令。单手命令不接受未选侧的非空序列号。
 
-推荐先在 `real` 终端按 Ctrl+C，等待回零、停用和退出，再停止 `manus`。**先停止生产者不会停止机械手**；输出会继续保持最后目标。零位指关节 `0 rad`，不是自动标定，回零期间必须保持工作空间清空。
+自动使能只尝试一次。显式停用或故障会取消等待，故障后不会自动重新使能。SDK 或反馈异常会触发对所有已选手的停用。
 
-`/sharpa/enable` 保留给调试和恢复，不是标准启动步骤。显式停用会取消等待中的自动使能；现场恢复时可按需调用：
+若只想检查目标校验而不连接或驱动真机：
 
 ```bash
+pixi run real dry_run:=true
+```
+
+`dry_run` 不加载硬件后端、不发布实测反馈，也不模拟真实跟随动态；它不是机械手运动安全验证。当前 dry-run 按双手处理，自动使能等待双侧有效目标，即使命令中指定了 `left` 或 `right`。
+
+### 3. 正常停机
+
+先在 **`real` 终端**按 Ctrl+C，等待回零、停用和退出，再停止 `manus`。
+
+正常 Ctrl+C/SIGTERM 时，健康且已使能的输出尝试用同一指数平滑回到全关节 `0 rad`，实测位置进入容差后停用。默认回零总时限为 10 秒、容差为 `0.02 rad`。零位不是自动标定，回零期间也必须保持工作空间清空。
+
+**不要通过停止手套输入来停机。** 故障、SIGKILL、掉电或 SDK 阻塞时不能保证回零或电机已停用；紧急情况使用实体急停。
+
+可选的调试/恢复服务：
+
+```bash
+# 显式停用，也会取消等待中的自动使能
 pixi run ros2 service call /sharpa/enable std_srvs/srv/SetBool '{data: false}'
+
+# 仅在排除故障、确认设备状态和工作空间后显式使能
 pixi run ros2 service call /sharpa/enable std_srvs/srv/SetBool '{data: true}'
 ```
 
-## 录制一条 SpeedTest 数据
+该服务不是标准启动步骤。设备发现等启动失败需要处理原因后重启输出进程，不能仅靠服务重新连接。
 
-先运行 `pixi run manus`，再在项目目录的另一个终端运行：
+## 诊断与数据录制
+
+### 查看原始关键点
 
 ```bash
-pixi run record-speed-test
+pixi run rawmanus
 ```
 
-做完一条动作后按 **Ctrl+C**，保存到当前目录的 **`SpeedTest.HDF5`**。也可用 `pixi run record-speed-test --seconds 30` 定时录制。脚本为 `scripts/record_speed_test.py`，只订阅数据，不发布指令、不使能硬件；无需启动 `sim` 或 `real`。已有文件不会覆盖，重新录制前先移动旧文件，或用 `--output` 指定另一个文件。
+该命令只启动采集与关键点窗口，不启动重定向、机械手动力学或真机输出。若 `manus` 已运行，使用订阅模式，避免第二个采集客户端：
 
-文件按 `left/`、`right/` 分组，每侧包含：
+```bash
+pixi run rawmanus with_client:=false
+```
 
-| 分组 | 来源 | `values` 形状 | 用途 |
-| --- | --- | --- | --- |
-| `manus_raw` | `/manus/{side}/raw_poses` | `N × 25 × 7` | 后续从原始 Manus 输入开始测试整条链路 |
-| `sharpa_joint` | `/sharpa/{side}/command` | `N × 22` | 后续跳过重定向，直接测试关节目标跟随 |
+窗口显示每手 25 个关键点、编号和彩色手指骨架：手根为点 `0`，拇指 `1–4`，食指 `5–9`，中指 `10–14`，无名指 `15–19`，小指 `20–24`。这里的“原始”是适配器发布的数据，已转为手根相对坐标并重排顺序，不是未修改的 SDK 世界坐标。
 
-位姿列顺序为 `x,y,z,qx,qy,qz,qw`，位置单位 m；关节角单位 rad，顺序保存在 `joint_names` 属性。每组保存 `stamp_ns`、接收 ROS 时间 `received_ros_ns`、单调相对时间 `elapsed_ns`，单位 ns。各话题独立采样，不按数组下标强行配对；原始位姿与关节结果可按源时间戳关联。过载丢弃、best-effort 传输和录制边界可能导致部分输入没有对应输出。历史录制中的 `manus_input` 分组属于旧重采样路径，新录制不再生成它。
+窗口使用 MuJoCo 渲染，不执行动力学；等待、实时和过期状态会区分显示。过期状态仅用于诊断，不控制机械手。关闭窗口或 Ctrl+C 会退出本次诊断组，不停止订阅模式下已有的外部生产者。
 
-这里的 `sharpa_joint` 是未经过输出端裁剪的重定向目标，**不是机械手实际反馈**。这一个脚本只保存测试输入，不提供回放或实际跟随速度报告；后续两种测试都可读取同一文件，再另行测量实际反馈。退出时会打印各组帧数，空组会警告；文件属性 `complete=true` 表示正常停止并完成缓存写入，不保证所有话题都有数据。
+若人手伸直但机械手某些手指仍弯曲：先检查原始骨架。原始骨架已弯曲时优先检查佩戴和标定；原始骨架正常而重定向结果异常时，再检查映射与求解。
+
+### 使用已有原始 ROS 发布者
+
+```bash
+pixi run manus with_client:=false
+```
+
+只启动重定向，不启动本项目采集适配器；该 Pixi 任务仍会执行其声明的构建依赖。外部发布者应在相同 ROS 域提供：
+
+- `/manus/{left,right}/raw_poses` 上的 `geometry_msgs/PoseArray`，每手恰好 25 个位姿。
+- 与适配器一致的关键点顺序和手根相对坐标，位置单位 m。
+- 有限位置及可归一化的非零四元数。
+- 正值、每手严格递增且不在未来的源时间戳。
+- `frame_id` 使用 `manus_left_hand` 或 `manus_right_hand`；重定向保留该字段，但不会据此变换输入坐标。
+
+### 录制 SpeedTest
+
+先运行 `pixi run manus`，在另一个终端执行：
+
+```bash
+# Ctrl+C 正常停止并保存到当前目录 SpeedTest.HDF5
+pixi run record-speed-test
+
+# 或定时录制到另一个新文件
+pixi run record-speed-test --seconds 30 --output session.HDF5
+```
+
+录制器只订阅，不发布指令、不使能硬件；无需启动 `sim` 或 `real`。已有文件不会覆盖。
+
+HDF5 按 `left/`、`right/` 分组：
+
+| 子分组 | 来源 | `values` 形状 |
+| --- | --- | --- |
+| `manus_raw` | `/manus/{side}/raw_poses` | `N × 25 × 7` |
+| `sharpa_joint` | `/sharpa/{side}/command` | `N × 22` |
+
+位姿列为 `x,y,z,qx,qy,qz,qw`，位置单位 m；关节角单位 rad，关节顺序存于 `joint_names` 属性。每组另存 `stamp_ns`、`received_ros_ns`、`elapsed_ns`，单位 ns，分别为源时间、接收 ROS 时间和相对录制起点的单调时间。
+
+各话题独立采样，不按数组下标配对，可按源时间戳关联。`complete=true` 表示正常停止并完成缓存写入，不保证所有话题都有数据或没有丢帧。`sharpa_joint` 是输出端裁剪前的重定向目标，**不是实测反馈**。该工具不提供回放或实际跟随速度报告；历史文件中的 `manus_input` 属于旧重采样路径，新录制不生成它。
+
+## 配置
+
+### 路径与环境变量
+
+| 环境变量 | 默认路径/值 | 用途 |
+| --- | --- | --- |
+| `SHARPA_MANUS_SDK` | `<default-site-packages>/sharpa_teleop_manus_resources` | Manus SDK、重定向库和关节 URDF |
+| `SHARPA_MANUS_CALIBRATION_DIR` | `$PIXI_PROJECT_ROOT/calibration` | 操作者私有标定目录 |
+| `SHARPA_WAVE_SDK` | `<default-site-packages>/sharpa_teleop_wave_resources` | 硬件 SDK |
+| `SHARPA_MODELS` | `<default-site-packages>/sharpa_teleop_model_resources` | 仿真模型 |
+| `RETARGET_PYTHON` | `$PIXI_PROJECT_ROOT/.pixi/envs/retarget/bin/python` | 重定向解释器 |
+| `ROS_DOMAIN_ID` | `42` | ROS 通信域 |
+
+`<default-site-packages>` 为 `$PIXI_PROJECT_ROOT/.pixi/envs/default/lib/python3.12/site-packages`。`pixi.toml` 为已安装资源、解释器和 ROS 域定义默认值；标准工作流不依赖兄弟目录。只有有意替换资源版本时才覆盖相应路径，并在变更 Manus SDK 后重新运行 `pixi run manus-build`，确保构建链接和运行加载的 SDK 匹配。
+
+`calibration/` 用于本机操作者的私有标定，不能随仓库分发。操作者应将获授权的标定复制到该目录，或按 SDK 流程使用 SDK 自身标定。原生适配器从该目录读取 `Calibration_left.mcal`、`Calibration_right.mcal`；缺失文件会告警并保留 SDK 标定，但告警消失或保留 SDK 标定都不能等同于当前操作者已正确标定。
+
+### Launch 参数与 YAML
+
+参数在启动时读取，修改后需重启节点。
+
+| 命令 | 主要 launch 参数 |
+| --- | --- |
+| `manus` | `config`、`sdk_root`、`calibration_dir`、`worker_python`、`with_client`、`project_root` |
+| `rawmanus` | `sdk_root`、`calibration_dir`、`with_client`、`project_root` |
+| `sim` | `config`、`models_root`、`headless`、`smoothing_time_sec`、`control_hz`、`feedback_hz` |
+| `real` | `config`、`sdk_root`、`native_sdk_root`、`dry_run`、`auto_enable`、`return_to_zero_on_exit`、`homing_timeout_sec`、`homing_tolerance_rad`、`smoothing_time_sec`、`control_hz`、`left_serial`、`right_serial` |
+
+示例：
+
+```bash
+pixi run manus calibration_dir:=/path/to/calibration
+pixi run sim models_root:=/path/to/sharpa-urdf-usd-xml headless:=true
+pixi run real right right_serial:=RIGHT_SN auto_enable:=false
+```
+
+默认 YAML 为 `src/sharpa_teleop/config/teleop.yaml` 和 `src/sharpa_teleop/config/sim.yaml`。**Launch 中映射的参数覆盖 YAML，launch 默认值也参与覆盖**；调整这些参数应显式传入 `<arg>:=<value>`，不能只修改 YAML。
+
+`teleop.yaml` 的节点默认值是 `dry_run: true`、`auto_enable: false`、`return_to_zero_on_exit: false`，但标准 `real` 启动会覆盖为真机、自动使能和正常退出回零。`feedback_hz`、`startup_timeout_sec`、`future_tolerance_sec` 等未映射为 `real` launch 参数的输出节点设置通过 YAML 配置。
+
+`sdk_root` 指向已安装的 Manus/重定向资源；`native_sdk_root` 才是已安装的硬件 SDK，二者不可混用。可通过以下命令查看启动参数，不启动运行节点：
+
+```bash
+pixi run sim --show-args
+pixi run real left --show-args
+```
+
+### 通信域
+
+所有参与通信的终端必须使用相同 `ROS_DOMAIN_ID`。每个域只应有一个手套生产者；实机域不要混入测试发布者或不受控输出节点。
+
+默认值由 `pixi.toml` 的 `[activation.env]` 固定为 `42`。更换通信域时修改该值，再重新启动所有参与节点；仅在 `pixi run` 前加 `ROS_DOMAIN_ID=76` 会被当前激活配置覆盖，不应依赖这种写法。
 
 ## ROS 接口
 
-| 接口 | 类型 | 内容 |
-| --- | --- | --- |
-| `/manus/left/raw_poses`、`/manus/right/raw_poses` | `geometry_msgs/PoseArray` | `manus_ros` 直接发布的原始数据；每手 25 个关键点 |
-| `/sharpa/left/command`、`/sharpa/right/command` | `sensor_msgs/JointState` | 官方原版 IPOPT 重定向输出；每手 22 个关节目标，单位 rad，保留输入时间戳 |
-| `/sharpa/left/target`、`/sharpa/right/target` | `sensor_msgs/JointState` | `sharpa_output` 校验后的目标，不是测量值 |
-| `/sharpa/left/joint_states`、`/sharpa/right/joint_states` | `sensor_msgs/JointState` | 真实 SDK 读取的关节反馈；仅 `real` 的真实输出模式 |
-| `/sim/sharpa/left/joint_states`、`/sim/sharpa/right/joint_states` | `sensor_msgs/JointState` | MuJoCo 关节位置 rad、速度 rad/s；仅 `sim` |
-| `/sharpa/enable` | `std_srvs/srv/SetBool` | 输出节点的可选调试/恢复使能与停用服务；标准 `real` 启动不需要调用 |
+以下 `{side}` 为 `left` 或 `right`：
 
-流式话题使用 **best-effort、volatile、keep-last**。通常深度为 1；`retarget` 输入深度为 4，吸收短时调度抖动。查看话题时建议显式选择 best-effort QoS：
+| 接口 | 类型 | 含义 |
+| --- | --- | --- |
+| `/manus/{side}/raw_poses` | `geometry_msgs/PoseArray` | 每手 25 个手根相对关键点位姿 |
+| `/sharpa/{side}/command` | `sensor_msgs/JointState` | 每手 22 个重定向关节目标，rad，保留输入时间戳 |
+| `/sharpa/{side}/target` | `sensor_msgs/JointState` | 输出节点校验、裁剪后的目标，不是测量值 |
+| `/sharpa/{side}/joint_states` | `sensor_msgs/JointState` | 真实硬件关节位置反馈，仅非 dry-run 输出 |
+| `/sim/sharpa/{side}/joint_states` | `sensor_msgs/JointState` | MuJoCo 实际 `qpos/qvel`，单位 rad、rad/s |
+| `/sharpa/enable` | `std_srvs/srv/SetBool` | 输出节点使能/停用服务 |
+
+真机单手模式只订阅、发布所选侧接口。流式话题采用 **best-effort、volatile、keep-last**；通常深度为 1，重定向输入深度为 4。
 
 ```bash
 pixi run ros2 topic list
-pixi run ros2 topic echo /sim/sharpa/left/joint_states --qos-reliability best_effort
+pixi run ros2 topic echo /sharpa/right/command --qos-reliability best_effort
+pixi run ros2 topic echo /sim/sharpa/right/joint_states --qos-reliability best_effort
 ```
 
-`manus_ros` 在真实 SDK 采集回调写入 `header.stamp`，发布手根相对坐标下的 25 个有限位置和归一化四元数。它按实际采集频率发布，没有额外频率定时器；`retarget` 直接订阅 `/raw_poses`，没有 `/poses` 重采样话题或 40 ms 插值缓冲。
+链路使用 ROS 墙钟时间戳，仿真不发布 `/clock`，不要为这条链路开启 `use_sim_time`。跨主机运行时需保持时钟同步，未来时间戳默认拒收。
 
-重定向左右手独立并行，每手保留一个正在计算的姿态和至多 4 个待处理姿态；过载时丢弃最旧的待处理姿态，不中断当前求解、不无限积压。只有官方求解完成后才发布对应输入源时间戳的结果，不重复求解旧帧凑频率。停止输入后不再生成新关节结果，但两个消费者继续跟随最后目标。
+## 控制策略与安全边界
 
-数值后端为官方原版 IPOPT，保留模型、权重、状态更新和 `alpha=0.2` 关节滤波。实际结果频率由原始采集、IPOPT 吞吐及负载决定，不承诺每个输入都能完成求解。仿真与真机在各自 500 Hz 循环中使用同一 20 ms 时间常数平滑；输入消息年龄不再触发拒收或停用，关节限位、格式与顺序校验及 SDK 故障处理仍保留。
-
-**历史 IPOPT 基线（当时的队列配置不同，不代表当前吞吐）**：同一份约 10 秒 `SpeedTest.HDF5` 的 1× 原始位姿回放对比（隔离 ROS 域、无真机），由 60 ms 缓冲/8 帧待处理改为 40 ms/仅最新帧后，左右源时间到关节输出的中位延迟从 102.94 / 101.87 ms 降为 54.64 / 54.80 ms，P99 从 110.85 / 110.96 ms 降为 60.95 / 61.27 ms。位姿仍约 250 Hz，该片段未出现超过 6 ms 的插值源时间间隔。关节输出间隔 P99 则从 14.71 / 14.28 ms 增至 17.32 / 17.93 ms，不能把延迟下降理解为吞吐或间隔抖动同时改善。在共同源时间网格上，新旧关节结果差异 RMSE 为 0.25° / 0.56°；相对录制关节的 RMSE 从 3.52° / 2.08° 变为 3.49° / 2.13°。这是单段录制实测，不保证其他动作或负载下的数值。
-
-## 配置与参数路由
-
-配置文件在启动时读取；修改后重启相应节点：
-
-- [`src/sharpa_teleop/config/teleop.yaml`](src/sharpa_teleop/config/teleop.yaml)：真机指数平滑和输出生命周期参数。
-- [`src/sharpa_teleop/config/sim.yaml`](src/sharpa_teleop/config/sim.yaml)：MuJoCo 节点参数。
-
-### 主要节点参数
-
-| 节点 | 参数 | 默认值 | 含义 |
-| --- | --- | --- | --- |
-| `sharpa_output` | `dry_run` | YAML 中为 `true`；`real` 覆盖为 `false` | 是否禁止真机连接与运动 |
-| `sharpa_output` | `left_serial` / `right_serial` | YAML 中为空；`real` 注入已选侧默认 SN | 明确选定机械手 |
-| `sharpa_output` | `auto_enable` | YAML 中为 `false`；`real` 覆盖为 `true` | 一次性等待已选侧有效目标后自动使能，无输入年龄限制 |
-| `sharpa_output` | `return_to_zero_on_exit` | YAML 中为 `false`；`real` 覆盖为 `true` | 正常退出时健康已使能输出回零后停用 |
-| `sharpa_output` | `homing_timeout_sec` / `homing_tolerance_rad` | `10.0` / `0.02` | 回零总时限与实测收敛容差（rad） |
-| `sharpa_output` / `mujoco_sim` | `smoothing_time_sec` | `0.02` | 指数平滑时间常数，秒；不是固定速度上限 |
-| `sharpa_output` / `mujoco_sim` | `control_hz` / `feedback_hz` | `500.0` / `30.0` | 最新目标平滑执行与实测反馈频率 |
-
-### Launch 参数
-
-| 启动方式 | 可用参数与职责 |
-| --- | --- |
-| `pixi run manus` | `config`、`sdk_root`、`calibration_dir`、`worker_python`、`with_client`、`project_root`。`sdk_root` 同时路由给本地适配器和重定向；空的 `calibration_dir` 默认使用 `<sdk_root>/client`；`with_client:=false` 跳过本地适配器，保留外部原始 ROS 发布者；`project_root` 用于稳健定位适配器脚本。 |
-| `pixi run rawmanus` | `sdk_root`、`calibration_dir`、`with_client`、`project_root`。仅原生采集与原始关键点窗口；`with_client:=false` 只订阅已有数据，不构建或连接 Manus SDK。 |
-| `pixi run sim` | `config`、`models_root`、`headless`、`control_hz`、`smoothing_time_sec`、`feedback_hz`。仅仿真消费者；默认 500 Hz、20 ms 时间常数、30 Hz 反馈。 |
-| `pixi run real [left\|right]` | `config`、`sdk_root`、`native_sdk_root`、`dry_run`、`auto_enable`、`return_to_zero_on_exit`、`homing_timeout_sec`、`homing_tolerance_rad`、`left_serial`、`right_serial`、`control_hz`、`smoothing_time_sec`。仅真机消费者；默认 500 Hz、20 ms 时间常数。 |
-
-Launch 参数覆盖 YAML 同名值。`sim` 不接受生产者或真机生命周期参数；`real` 不接受 MuJoCo 或生产者参数。重定向的 `startup_timeout_sec=60`、`response_timeout_sec=0.5` 仅检测工作进程启动或请求无响应，不是输入断流 Watchdog；没有消息时不触发这些计时器。
-
-常用覆盖示例：
-
-```bash
-# 使用已存在的直接 ROS 原始位姿发布者
-pixi run manus with_client:=false
-
-# 使用外部标定目录
-pixi run manus calibration_dir:=/path/to/calibration
-
-# 仅仿真使用另一份模型并禁用窗口
-pixi run sim models_root:=/path/to/sharpa-urdf-usd-xml headless:=true
-
-# 真机输出使用另一份原生硬件 SDK
-pixi run real native_sdk_root:=/opt/sharpa-wave-sdk
-```
-
-长期更换 Manus SDK 位置时，修改 `pixi.toml` 默认环境的 `SHARPA_MANUS_SDK` 配置后重新运行 `pixi run manus-build`；`sdk_root` 会同时路由给本地适配器和重定向，并让适配器优先加载该根目录的 `client/ManusSDK/lib`。标定目录可通过 `calibration_dir` 或 `SHARPA_MANUS_CALIBRATION_DIR` 覆盖。`sdk_root` 指向 Manus/重定向仓库，不是独立机械手 SDK。
-
-### ROS 通信域隔离
-
-默认通信域为 `42`。每个域只应有一个 `manus` 生产者；实机域中不要同时使用测试发布者或不受控消费者。所有参与通信的终端必须使用相同的 `ROS_DOMAIN_ID`：
-
-```bash
-# 终端 1
-ROS_DOMAIN_ID=76 pixi run manus
-
-# 终端 2
-ROS_DOMAIN_ID=76 pixi run sim
-```
-
-## 项目结构
+仿真与真实输出统一使用“最新目标 + 指数平滑”：
 
 ```text
-pixi.toml / pixi.lock            环境、任务与依赖锁文件
-native/CMakeLists.txt            本地 Manus SDK → ROS 2 适配器构建
-native/manus_ros.cpp             MANUS SDK 生命周期与直接 raw_poses 发布
-native/manus_pose.hpp            关键点顺序、根坐标及旋转转换
-scripts/
-  workspace.py                   构建、启动、依赖检查和帮助
-  manus_client.py                本地适配器构建与运行，不复制外部 SDK
-src/sharpa_teleop/
-  launch/manus.launch.py         原始频率采集与官方 IPOPT 生产者组
-  launch/rawmanus.launch.py      可选原生采集与原始关键点诊断窗口
-  launch/sim.launch.py           MuJoCo 消费者
-  launch/real.launch.py          安全输出消费者
-  config/                        节点配置
-  sharpa_teleop/
-    raw_manus.py                 原始关键点与指骨连线三维显示，不经过重定向
-    retarget.py                  ROS 与独立重定向进程桥接
-    retarget_worker.py           官方重定向库适配
-    sharpa_output.py             真实输出及 dry-run
-    safety.py                    关节、时间戳格式校验与指数平滑
-    sim_model.py                 外部 MuJoCo 模型加载与动力学
-    mujoco_sim.py                仿真 ROS 接口和窗口
-tests/                           安全、重定向、仿真和输出生命周期回归测试
+q_next = q_prev + (1 - exp(-dt / tau)) * (target - q_prev)
 ```
 
-## 验证范围与已知限制
+- 默认控制循环为 500 Hz，`tau = smoothing_time_sec = 0.02 s`；`dt` 使用实际经过的单调时间。
+- 新目标立即替换旧目标，不回放历史轨迹。20 ms 时间常数约需 60 ms 接近阶跃变化量的 95%，这不是实机跟随延迟保证。
+- 不限制固定速度、步长、加速度或 jerk。较大角度变化会产生较大速度，指数平滑不是安全限速。
+- 没有输入 Watchdog，也不因消息年龄拒收。格式有效且时间戳递增的旧目标仍可接受；断流不会停用输出。
+- 检查关节数量、URDF 名称顺序、有限值和源时间戳；有限目标超限时裁剪。拒收 NaN/Inf 关节值，以及非正值、重复、乱序或默认不允许的未来时间戳。
+- 硬件实测反馈和最终 SDK 下发边界严格检查限位，不裁剪反馈来绕过异常。
+- 真机连接关闭 SDK 的设备校时和触觉初始化：`disable_sync_time=true`、`disable_tactile=true`；本项目是关节遥操作，不提供触觉反馈。
+- SDK/反馈故障触发停用，正常退出回零仍有超时和实测容差检查；这些时限不是输入 Watchdog。
 
-当前原始频率直连与 20 ms 指数平滑验证：
-
-- `pixi run build` 成功，`pixi run test` 的 22 项回归测试通过，包括断流后继续跟随、目标反向替换、实际经过时间平滑、限位与时间戳校验、SDK 故障停用及容差回零。
-- 隔离 ROS 域 119 中，录制原始位姿以非等间隔约 **105.26 Hz** 发布；真实 ROS 重定向节点使用官方 IPOPT，左右关节结果约 **83.19 / 79.15 Hz**。保留输入时间戳，不经重采样；这是该次回放的吞吐，不是真手套采集频率保证。
-- 同时运行实际 MuJoCo 节点及记录后端替换硬件 SDK 的输出节点，左右下发约 **499.92 Hz**，仿真控制约 **499.99 Hz**；停止输入后测量 1 秒，两端每手仍各下发 500 次并收敛到同一最后目标。首次使用 10 秒前的有效递增时间戳目标也可使能并跟随，不再因消息年龄拒收。原生硬件 SDK 未加载，未连接或驱动真机。
-- 实际 `sim` GLFW 窗口正常显示双手；关闭窗口后 launch 退出码为 0。订阅模式的实际 `manus` launch 仅启动重定向，其 ROS 订阅为 `/manus/{left,right}/raw_poses`。
-- 数据与窗口截图在本地 `build/native-rate-follow/smoke.json`、`simulation.png`。官方求解过程中仍出现 `nlp_f` 的 Inf 诊断；本次输出通过有限值与收敛检查，没有修改官方求解器以隐藏诊断。该验证不证明真机运动安全、网络实时性或所有姿态的优化稳定性。
-
-真机遥操作验证（2026-09-30，操作者提供日志与运行反馈）：
-
-- `pixi run real` 成功连接 WaveSE-L-01 与 WaveSE-R-01；两手固件均为 **3.0.10**，日志显示与 **Sharpa SDK 5.0.11** 的版本检查通过。
-- 输出先保持禁用，随后记录 `Automatic enable complete; tracking selected hands`；操作者确认右手真机遥操作正常。未量化真机延迟、网络下发频率或全关节范围，不据此宣称长期稳定或硬实时。
-- 此前右手实测角度超出 URDF 范围会阻止使能；本项目没有放宽反馈限位或裁剪实测反馈来绕过该保护。该次成功不能单独证明标定是此前超限的唯一原因。
-
-历史 IPOPT 恢复验证（当时仍有前级重采样）：
-
-- 当时 `pixi run test` 的 26 项回归测试通过；移除加速求解器专属测试，保留首帧同步、输入校验、仿真与真机输出安全回归。当前链路的验证另列，历史数量不代表当前测试集合。
-- 官方工作进程双手各处理 320 帧，关节名称、有限值、帧号及左右手对应检查通过。右手使用诊断时采到的微小变化片段循环回放；恢复后的全部右手结果与原 IPOPT 对照结果一致，最大角度差为 0。
-- 同一回放稳定区间内，右手逐帧关节变化 RMS 为 **0.00251°**，最大单帧变化 **0.00736°**；左右请求并行提交后的往返耗时中位数 **12.27 ms**。这些是离线片段结果，不保证当前佩戴者或所有姿态的频率、延迟与稳定性。
-- 结果保存在本地 `build/right-jitter-diagnosis/restored_ipopt.json` 和 `.npz`。未连接或使能真机；前级重采样与后级 500 Hz 输出设置均未修改。
-
-原始关键点诊断窗口验证：
-
-- `pixi run rawmanus --show-args` 完成 ROS 包及本地采集适配器构建，并正确列出启动参数。已有的 CLI 路由回归测试通过。
-- 在隔离 ROS 域 119 使用录制的 `manus_raw` 双手关键点运行订阅模式，实际 GLFW 窗口显示双手彩色骨架、点编号及 LIVE 状态；停止发布后，两手骨架隐藏并显示红色 STALE。窗口管理器正常关闭后，launch 退出码为 0。
-- 验证未连接手套或机械手；使用无效 SDK 路径仍可运行 `with_client:=false`。窗口截图保存在本地 `build/rawmanus-smoke/live.png`、`stale.png`。录制数据验证不代替当前佩戴者的实时标定检查。
-
-历史限速与输入 Watchdog 输出层验证（两项现已移除）：
-
-- 当时 `pixi run test` 的 27 项 Python 回归测试通过。旧输出插值测试随旧实现删除；覆盖单帧启动、目标反向替换、到达目标后持续下发但不刷新 Watchdog、调度延误不追赶大步。当前实现和验证见本节开头。
-- 在隔离 ROS 域 119 中，用约 **102.56 Hz** 的非等间隔合成关节目标驱动真实 ROS 输出节点 30 秒；硬件接口替换为零 I/O 延时的记录后端，未加载原生 SDK、未连接或使能真机。左右记录接口调用均约 **499.73 Hz**，首次输入到首个运动指令约 **3.11 / 3.12 ms**；单步最大 **0.002 rad**。间隔 P99 为 **2.46 / 2.47 ms**，最大约 **13.32 ms**，不是硬实时保证。
-- 停止输入后约 **501.27 ms** 停用，之后不再下发。结果保存于本地 `build/speedtest-results/latest_follow_500hz.json` 和对应 `.npz`；这些数据验证主机输出逻辑，不代表真机网络时序或电机响应。
-- 本机直接使用多线程执行器 `spin()` 时，曾出现回调调度饥饿及提前断流。保留双线程隔离 SDK 调用与输入回调，改为每次 `spin_once()` 分发后让出 100 μs；上述持续测试使用此调度方式，不靠放宽 Watchdog 达标。
-
-历史 L-BFGS-B 加速后端的离线验证（该后端已移除，以下频率不代表当前 IPOPT）：
-
-- 此前 `pixi install -e retarget`、`pixi run build` 和当时的 28 项 Python 回归测试通过；当前测试结果见本节开头。
-- 默认输入为 250 Hz，源时间缓冲仍为 40 ms。在隔离 ROS 域 107 中，将 `SpeedTest-250hz.HDF5` 的 2,477 帧/手循环回放 3 遍，预热后测量约 30 秒。左右手各收到并输出 7,431 帧，无丢帧、无重复源时间戳，实际输出为 **250.025 / 250.024 Hz**。
-- `/poses` 发布到 `/command` 接收的中位延迟为 **4.01 / 4.18 ms**，P99 为 **9.38 / 9.88 ms**；这些数值不包含前级 40 ms 缓冲。输出间隔 P99 为 **6.23 / 6.06 ms**，最大 **16.28 / 16.47 ms**。这是持续平均 250 Hz，不是硬实时每 4 ms 必达的保证。
-- 该次全部 7,431 帧/手均为有限值、源时间递增、关节名称与 URDF 顺序匹配，原始结果已在关节限位内，无须裁剪。相对原算法按相同录制帧对齐、排除最初 50 帧后，轨迹 RMSE 为 **8.11° / 6.68°**，最大关节差异 **47.58° / 36.52°**。消除历史运动项后的静态目标函数均值约增加 **3.13% / 4.03%**，不能将提频称为无损优化。
-- 报告保存在本地 `build/speedtest-results/250_ros_verified.json`、对应 `.npz` 和 `250_quality_verified.json`。未连接真机；更换算法后的动作应先在仿真中确认，再决定是否用于真实机械手。其他动作、系统负载或原始输入断流下的频率与质量不由此次测试保证。
-
-以下是直接 ROS 路径在使用原 IPOPT 后端时的历史记录：
-- 隔离 ROS 域中以合成原始 `PoseArray` 驱动 `manus with_client:=false`：8 秒收到左右手 1963 / 1962 帧插值位姿和同等数量的真实官方重定向结果。持续重发旧时间戳后，位姿和关节输出停止，未将接收流量冒充新鲜源数据。
-- 真实手套直接 ROS 采样通过：重新插拔接收器恢复 SDK 初始化后，15 秒窗口内左右手原始位姿约 116.89 / 117.01 Hz，插值位姿约 249.99 / 250.00 Hz；原始消息最大观测年龄分别为 0.861 / 1.147 ms。每手只有一个 `manus_native` 原始发布者，25 关键点、有限值、单位四元数、根坐标和时间戳检查通过；左右标定文件成功加载。
-- 同次测量左右真实重定向输出约 194.98 / 244.09 Hz，求解结果时间戳均能匹配输入插值位姿；直连 ROS 不代表求解器已达到稳定 250 Hz。运行中旧 ZMQ 2044 端口没有监听者；SIGINT 后整个生产者组退出码为 0。未启动或使能真实机械手。
-
-以下记录全部来自切换到直接 ROS 传输之前，只作历史背景：它们不证明当前 `manus_ros` 路径，也不是 ZMQ/Protobuf 的运行说明。
-
-### 切换前历史验证记录
-
-- 双级时间插值更新：构建与回归测试通过；新增关节时间插值边界、四元数 SLERP 及上游递增 frame_id 回归覆盖。
-- 在隔离 ROS 域中，用合成原生格式 ZMQ 数据驱动旧 `manus with_client:=false`，运行旧桥接和官方重定向库。10 秒采样收到左手 160 帧位姿、160 帧重定向命令、88 帧通过校验的直接 dry-run 目标，以及 298 帧 MuJoCo 反馈；匹配的输出目标与重定向位置及源时间戳一致。
-- 输入桥接和重定向各只有一个发布者；仿真不再发布用于驱动真机的命令话题。
-- 停止 MuJoCo 后，生产者与直接 dry-run 输出继续工作，5 秒收到 78 帧重定向命令和 68 帧通过校验的直接目标；真实输出消费者启动时使用不存在的仿真模型路径，证明该路径不依赖 MuJoCo 模型资源。
-- 旧原生客户端伪终端接入实测：在隔离 ROS 域启动完整旧生产者，5 秒收到左/右手 474 / 406 帧有效位姿和 242 / 230 帧重定向关节命令。SIGINT 后旧生产者组退出码为 0，旧传输端口释放；未启动真机输出。
-- 双级插值实测（隔离 ROS 域、旧 Manus 客户端，未启用真机）：一次 15 秒窗口内原始左/右手约 103.73 / 105.15 Hz，插值位姿均为 250.00 Hz；真实重定向结果为 233.67 / 249.69 Hz，尚未达到双手稳定各 250 Hz。录制的真实姿态序列直接回放官方优化器，左右手约 284.65 / 243.87 次求解每秒，右手 P99 求解耗时约 6.206 ms。
-- 合法 250 Hz 关节斜坡经真实输出定时器和假硬件后端验证，重采样约 500.00 Hz，间隔中位数 1.999 ms；停止输入后仍触发 watchdog。当时部分真实重定向结果超出 URDF 限位，被输出端拒收，未证明真实 Manus 到硬件的连续 500 Hz 执行；后续目标接收规则已改为裁剪有限越界角度，不扩大关节限位。
-- Pixi 环境安装、ROS 包构建、旧 Manus C++ 客户端构建，以及 ROS、官方重定向库、Sharpa Python SDK 的导入。
-- 合成 Manus Protobuf → 官方重定向库 → ROS → dry-run 输出，以及合成 Manus Protobuf → 官方重定向库 → ROS → MuJoCo 动力学。
-- 双手独立仿真目标跟踪、错误指令拒绝、断流保持、窗口启动和渲染。
-- 接入 Manus 许可证后的历史采样：4 秒内收到左手 467 帧、右手 470 帧有效 25 关键点数据；另一次 5 秒 ROS 采样收到左右手 240 / 238 条有效关节目标和每手 147 条仿真反馈。
-- 独立 Sharpa Wave SDK `5.0.11` 的只读设备发现：成功解析 `0302` 心跳并发现固件 `3.0.10` 的左手；未连接控制通道、使能或发送运动指令。
-- 历史 headless MuJoCo → dry-run 输出和模拟硬件生命周期试验；未连接真实机械手。
+500 Hz 是主机侧循环目标，不代表硬件伺服频率、网络发包频率或硬实时保证。本项目不是安全认证控制器；SDK 阻塞、网络故障、进程强制终止和掉电可能使软件无法完成停用，现场必须有急停和监护。
 
 ## 常见问题
 
 ### `No compatible license found`
 
-这是 Manus SDK 的授权提示，不是 ROS 或 Pixi 编译错误。连接或配置包含 SDK component 权限的有效许可证，并按照厂商流程连接、标定手套。不要同时运行另一个 MANUS Core 或 Core Integrated 实例。
+这是 Manus 授权问题。检查许可证是否包含 SDK-component 权限，并按厂商流程连接和标定手套。不要同时运行其他 MANUS Core / Core Integrated 实例。
 
-### 只看仿真，是否需要 Manus 许可证？
+### 仿真没有动作，或窗口无法打开
 
-`sim` 本身只是命令消费者，不启动 Manus 客户端；用符合接口的外部命令发布者测试仿真时不需要 Manus 许可证。标准两终端手套工作流仍需要许可证，因为 `manus` 生产者需要采集和重定向手套数据。
+确认生产者在运行，两端 ROS 域一致，原始位姿与关节目标话题有数据。`sim` 自身不生成动作；无显示环境时使用 `headless:=true`。真实反馈与仿真反馈是不同话题，不能互相替代。
 
-### 窗口无法打开或没有显示环境
+单独用符合接口约束的关节发布者测试 `sim` 不需要 Manus 许可证；标准手套工作流仍需要。
 
-只对仿真使用：
+### `cannot arm: timed out ... waiting for selected HAND device(s)`
 
-```bash
-pixi run sim headless:=true
-```
-
-该模式仍运行物理仿真并发布 ROS 反馈，但不创建窗口。`real` 没有 MuJoCo 窗口或显示设置。
-
-确认终端 1 正在运行 `pixi run manus`（或订阅模式下已有原始发布者），并确认所有终端使用相同 `ROS_DOMAIN_ID`。用 best-effort QoS 检查 `/manus/{left,right}/raw_poses` 和 `/sharpa/{left,right}/command`。仿真反馈在 `/sim/sharpa/*/joint_states`，真实反馈在 `/sharpa/*/joint_states`；不再有重采样 `/poses` 话题。断流不会停用输出，停机必须显式操作。
-
-### `cannot arm: timed out ... waiting for selected HAND device(s): left`
-
-这是原生 SDK 没有发现指定设备，不是 Manus 断流，也不是另一只手的关节越限导致。先核对 SN、左右手、设备供电和网段，再检查发现端口：
+检查指定序列号、左右手、供电和网段，再检查发现端口：
 
 ```bash
 ss -ulpn 'sport = :54321'
 ```
 
-如果显示 `pilot_sdk` 或另一个控制程序，请完全退出该程序（包括托盘后台）再重启 `pixi run real`。输出节点会锁定启动失败状态；释放端口后仅调用 `/sharpa/enable` 不会重新连接。重启后它会重新等待新鲜的 `/sharpa/{left,right}/command` 再自动使能一次。不要关闭关节限位检查绕过发现失败。
+若端口被 `pilot_sdk` 或其他控制程序占用，完全退出它们后重启 `real`。启动发现失败不会仅靠 `/sharpa/enable` 重新连接；不要关闭关节限位检查绕过问题。
 
 ### `HeartPacket Unsupported protocol version: 0302`
 
-心跳已到达，但当前硬件 SDK 不支持设备的心跳协议。Manus 仓库附带的 `SharpaWaveSDK_4.6.6` 在固件 `3.0.10` 上出现此错误；本机独立安装的 `/opt/sharpa-wave-sdk`（`5.0.11`）已验证能解析该心跳。用 `native_sdk_root` 指定厂商提供的兼容 SDK；不要覆盖 Manus 重定向库或绕过协议检查。`pixi run doctor` 会显示实际导入的硬件 SDK 路径。
+这是硬件 SDK 与设备固件的协议兼容性问题。使用随仓库分发且与设备固件兼容的 Wave SDK，或有意以 `native_sdk_root` 覆盖为获授权的兼容版本；不要覆盖重定向库或绕过协议检查。`pixi run doctor` 会显示实际导入的硬件 SDK 路径。
 
-### `target expired while arming`
+### NumPy / 重定向库 Python 版本错误
 
-输出会同时检查原始源时间和本地接收时间；使能结束时若目标已过期，会请求停用且不会自动重新使能。不要通过调大 `timeout_sec` 掩盖断流。检查已选侧的 `/sharpa/{left,right}/command` 是否持续更新，以及是否存在重复生产者、越限或重定向失败。
+执行 `pixi install --all --locked` 和 `pixi run doctor`。不要在 Python 3.12 ROS 进程直接加载 Python 3.10 重定向二进制，也不要混用系统 ROS 或其他 Conda 环境的 Python 路径。
 
-### 无法导入重定向库或 NumPy 报 Python 版本错误
+### 官方求解器诊断与退出警告
 
-执行 `pixi install --all` 和 `pixi run doctor`。不要在 Jazzy 的 Python 3.12 进程中直接加载上游 Python 3.10 二进制，也不要混用系统 ROS、其他 Conda 环境的 Python 路径。
+官方 IPOPT 可能出现 `nlp_f` 的 Inf 诊断，重定向工作进程退出时也可能报告 shared-memory `resource_tracker` 警告。检查求解结果和工作进程错误，不应通过隐藏诊断、伪造输出或关闭校验来绕过问题。一次成功运行不证明所有姿态的优化稳定性。
 
-### 上游 shared-memory 警告
+## 项目结构
 
-V4.0 重定向库在退出时可能报告 Python `resource_tracker` 的 shared-memory 警告。项目会清理自身工作进程；不要通过关闭保护检查或伪造输出绕过上游运行错误。
+```text
+pixi.toml / pixi.lock              环境、任务与依赖锁文件
+vendor/
+  *.whl                          固定版本 SDK、重定向及模型资源轮包
+calibration/                       操作者私有标定，不随仓库分发
+native/
+  CMakeLists.txt                  原生适配器构建
+  manus_ros.cpp                   Manus SDK 生命周期与 raw_poses 发布
+  manus_pose.hpp                  关键点顺序、坐标与旋转转换
+  test_manus_pose.cpp             原生位姿转换检查
+scripts/
+  workspace.py                   构建、启动、帮助与依赖检查
+  manus_client.py                原生适配器构建与运行
+  record_speed_test.py            HDF5 录制
+  package_vendor.py              维护者重建授权资源轮包；安装时不执行
+src/sharpa_teleop/
+  launch/                        生产者、诊断、仿真和真机启动文件
+  config/                        默认节点配置
+  sharpa_teleop/
+    retarget.py                  ROS 与独立工作进程桥接
+    retarget_worker.py           官方重定向库适配
+    raw_manus.py                 原始关键点诊断窗口
+    mujoco_sim.py                仿真 ROS 接口与窗口
+    sim_model.py                 随仓库模型加载与动力学
+    sharpa_output.py             真机输出、dry-run 与启停生命周期
+    safety.py                    校验和指数平滑
+  setup.py / package.xml         ROS 包元数据与节点入口
+tests/                           现有 Python 回归测试
+```
 
-## 安全与许可
+## 验证与许可
 
-- 硬件输出检查关节数量、名称顺序、有限值、源时间戳与本地接收时效；有限的上游目标角度裁剪到 URDF 限位内，硬件反馈仍严格校验。健康且已使能的实机仅在 Ctrl+C/SIGTERM 时按速度限制回到全关节 `0 rad` 后停用；故障或过期输入会跳过回零，且不会自动重新使能。
-- 网络故障、SDK 阻塞、进程被 `SIGKILL` 或掉电时，软件不能保证回零或电机已经停用。
-- 本项目不是硬实时或安全认证控制器。实机操作必须保留可用的实体急停和现场监护。
-- `native/manus_ros` 是本项目的本地适配器源代码；官方 Manus SDK 头文件、库和操作者标定，以及官方重定向二进制和模型资源均保留在外部仓库并适用各自许可证。构建只会包含/链接或读取这些外部资源，不会复制、暂存、重新授权或随本项目分发它们；使用或分发前请阅读上游 `License` / `LICENSE.txt` 和 `NOTICE.txt`。
+可运行 `pixi run test` 检查现有安全边界、输出启停、重定向和仿真回归；通过测试或 `doctor` 不等于完成实机安全验证。真机延迟、网络下发频率、全关节运动范围和长期稳定性需要在具体设备与现场条件下测量。
+
+项目内依赖集成已用全新临时目录验证：仅复制源代码、锁文件和资源 wheel，不复制已有环境、构建产物或个人标定，`pixi install --all --locked`、ROS 构建及 `doctor` 均成功。隔离 ROS 域中的官方 IPOPT 双手求解和实际 headless MuJoCo 目标跟随通过；现有 22 项回归测试通过，原生采集适配器重新构建成功。该验证未启动真机输出，不代表已验证新主机的手套许可证或实机运动。
+
+本仓库维护方已确认三套 `vendor/` 资源可随本仓库分发。该确认不改变任何接收者的授权边界：接收者仍必须遵守各 `vendor/` 资源原始的 `License`、`LICENSE.txt` 与 `NOTICE.txt`，并保留其中已有的许可和通知。个人操作者标定不随仓库分发；获得授权的标定只能由相应操作者按其许可使用。本项目源代码与上游资源的授权范围不同，ROS 包元数据标记为 `Proprietary`，不能将本项目或 `vendor/` 资源默认视为可自由再分发。
+
+### 维护者更新资源
+
+普通用户只需安装已提交的 wheel，不执行打包脚本。维护者获取新的授权原始资源后，可重建快照：
+
+```bash
+pixi run package-vendor --manus-sdk /path/to/authorized/sharpa-manus-sdk \
+  --models /path/to/sharpa-urdf-usd-xml --wave-sdk /path/to/authorized/sharpa-wave-sdk
+```
+
+打包脚本保持厂商文件内容及相对布局，不带入 `.git`、Python 缓存、个人标定或旧版嵌套硬件 SDK。Manus 包保留本项目所需的头文件、Integrated 库、官方求解器、URDF 及其网格；模型包按标准双手 XML 和 URDF 的引用收集网格；Wave 包保留原始 SDK 分发包，排除生成缓存。
+
+更新快照时同时调整打包脚本中的资源包版本、`pixi.toml` 对应 wheel 路径，并执行 `pixi install --all` 更新锁文件；将三个 wheel、清单、锁文件及打包脚本一起提交。删除已被替代的旧 wheel，避免安装源并存。资源轮包版本用于固定项目快照，不能代替厂商 SDK 自身的版本信息和授权。

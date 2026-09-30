@@ -1,4 +1,5 @@
-// Project-owned ROS adapter. MANUS SDK headers, libraries and calibration stay external.
+// Project-owned ROS adapter. The selected MANUS SDK supplies headers and libraries;
+// operator calibration is supplied separately.
 #include "manus_pose.hpp"
 #include "ManusSDK.h"
 
@@ -7,6 +8,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -33,9 +35,17 @@ void require_success(SDKReturnCode code, const char* operation) {
 class ManusPublisher final : public rclcpp::Node {
 public:
     ManusPublisher() : Node("manus_native") {
-        calibration_dir_ = declare_parameter<std::string>("calibration_dir", "");
+        const auto calibration_dir = std::getenv("SHARPA_MANUS_CALIBRATION_DIR");
+        calibration_dir_ = declare_parameter<std::string>(
+            "calibration_dir", calibration_dir == nullptr ? "" : calibration_dir);
         if (calibration_dir_.empty()) {
-            throw std::invalid_argument("calibration_dir must name the authorized calibration directory");
+            throw std::invalid_argument(
+                "calibration_dir is empty; set SHARPA_MANUS_CALIBRATION_DIR or the "
+                "calibration_dir ROS parameter");
+        }
+        if (!std::filesystem::is_directory(calibration_dir_)) {
+            throw std::invalid_argument(
+                "calibration_dir is not an existing operator calibration directory: " + calibration_dir_);
         }
         const auto qos = rclcpp::QoS(rclcpp::KeepLast(1)).best_effort().durability_volatile();
         for (std::size_t side = 0; side < sides_.size(); ++side) {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pixi entry points; external vendor SDK remains outside this repository."""
+"""Pixi entry points for project-integrated vendor resources."""
 import argparse
 import importlib
 import os
@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def sdk_root(value: str | None = None):
     value = os.environ.get("SHARPA_MANUS_SDK", "") if value is None else value
     if not value:
-        raise SystemExit("Set SHARPA_MANUS_SDK to your authorized sharpa-manus-sdk checkout.")
+        raise SystemExit("Set SHARPA_MANUS_SDK to an authorized sharpa-manus-sdk directory.")
     path = Path(value).expanduser().resolve()
     if not (path / "retargeting_alg_release_V4.0/include/hand_retargeting_optimizer.so").is_file():
         raise SystemExit(f"Missing V4.0 optimizer under {path}")
@@ -38,10 +38,11 @@ def ros_env():
 
 
 def main():
+    os.environ.setdefault("SHARPA_MANUS_CALIBRATION_DIR", str(ROOT / "calibration"))
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Setup:
-  pixi install --all
+  pixi install --all --locked
   pixi run build
   pixi run manus-build       # standalone native build; `manus` does this itself
   pixi run doctor
@@ -113,9 +114,11 @@ Topics:
 Configuration:
   Launch arguments override YAML. `real` defaults to dry_run:=false,
   auto_enable:=true, return_to_zero_on_exit:=true, and the selected serials;
-  later explicit launch arguments win. Manus/retarget SDK:
-  sibling ../sharpa-manus-sdk. Hardware SDK: SHARPA_WAVE_SDK, default
-  /opt/sharpa-wave-sdk. ROS uses Python 3.12; isolated optimizer process uses
+  later explicit launch arguments win. Pixi configures SHARPA_MANUS_SDK,
+  SHARPA_MODELS, and SHARPA_WAVE_SDK for project resources; sdk_root,
+  models_root, and native_sdk_root launch arguments override their matching
+  paths. SHARPA_MANUS_CALIBRATION_DIR selects the separately managed operator
+  calibration directory. ROS uses Python 3.12; isolated optimizer process uses
   Python 3.10.
 
 Safety:
@@ -197,7 +200,7 @@ Safety:
         base = sdk / "retargeting_alg_release_V4.0"
         code = "import sys; sys.path.insert(0, 'include'); import hand_retargeting_optimizer; print('Optimizer import OK')"
         subprocess.run([str(worker), "-I", "-c", code], cwd=base, check=True)
-        native = Path(os.environ.get("SHARPA_WAVE_SDK", "/opt/sharpa-wave-sdk")).expanduser()
+        native = Path(os.environ.get("SHARPA_WAVE_SDK", "")).expanduser()
         code = "import sys; from pathlib import Path; from sharpa_teleop.sharpa_output import _load_native_sdk; sdk = _load_native_sdk(Path(sys.argv[1])); print('Sharpa SDK import OK:', sdk.__file__)"
         subprocess.run([sys.executable, "-c", code, str(native)], env={**os.environ, "PYTHONPATH": str(ROOT / "src/sharpa_teleop")}, check=True)
         print("Dependencies OK. No hardware discovery, enable, or motion performed.")

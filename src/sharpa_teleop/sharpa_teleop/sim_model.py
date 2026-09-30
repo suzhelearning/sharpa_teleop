@@ -1,4 +1,4 @@
-"""Load the vendor's dual-hand dynamics without modifying or copying its assets."""
+"""Load the vendor's dual-hand dynamics without modifying source assets."""
 import math
 from pathlib import Path
 from xml.etree import ElementTree as ET
@@ -32,7 +32,7 @@ class HandSimulation:
         controlled = {name for model in self.joints.values() for name in model.names}
 
         # The supplied dual XML uses wave_01-relative mesh paths, rather than
-        # XML-file-relative paths. Resolve them in memory, keeping assets external.
+        # XML-file-relative paths. Resolve them in memory, keeping source assets unmodified.
         compiler = scene.find("compiler")
         if compiler is not None:
             compiler.set("meshdir", "")

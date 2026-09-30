@@ -47,7 +47,7 @@ class _SideState:
     last_send_monotonic: float | None = None
 
 def _resolve_upstream_root(sdk_root: str) -> Path:
-    """Locate the external checkout portion that contains the authoritative URDFs."""
+    """Locate the selected Manus SDK portion that contains the authoritative URDFs."""
     if not sdk_root:
         raise ValueError("sdk_root is required; set SHARPA_MANUS_SDK or the sdk_root parameter")
     supplied = Path(sdk_root).expanduser()
@@ -391,7 +391,7 @@ class SharpaOutput(Node):
         self._homing_tolerance_rad = 0.02
 
         self.declare_parameter("sdk_root", os.environ.get("SHARPA_MANUS_SDK", ""))
-        self.declare_parameter("native_sdk_root", os.environ.get("SHARPA_WAVE_SDK", "/opt/sharpa-wave-sdk"))
+        self.declare_parameter("native_sdk_root", os.environ.get("SHARPA_WAVE_SDK", ""))
         self.declare_parameter("dry_run", True)
         self.declare_parameter("left_serial", "")
         self.declare_parameter("right_serial", "")
