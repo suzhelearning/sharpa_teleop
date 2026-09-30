@@ -3,8 +3,9 @@
 # Finger dynamics/position gains are retained; untracked wrists/head are fixed.
 mujoco_sim:
   ros__parameters:
-    timeout_sec: 0.5
+    control_hz: 500.0
+    smoothing_time_sec: 0.02
     feedback_hz: 30.0
 # Physics: 2 ms steps, implicitfast. Viewer sync: 30 Hz.
-# Expired input holds the current simulated pose; fresh input resumes tracking.
+# No input watchdog or velocity cap: continue toward the latest target even after dropout.
 # Feedback: /sim/sharpa/{left,right}/joint_states (qpos/qvel, not target echoes).

@@ -134,10 +134,9 @@ def validate_command(
     stamp_nanoseconds: int,
     previous_stamp_nanoseconds: int,
     now_nanoseconds: int,
-    timeout_sec: float,
-    future_tolerance_sec: float,
+    future_tolerance_sec: float = 0.0,
 ) -> CommandValidation:
-    """Clip finite targets to limits; reject malformed, stale, or replayed commands."""
+    """Clip finite targets; reject malformed, future, or replayed commands, without expiry."""
     normalized, reason = model.validate(names, positions, clip=True)
     if normalized is None:
         return CommandValidation(False, reason)
@@ -147,12 +146,9 @@ def validate_command(
     if stamp_nanoseconds <= previous_stamp_nanoseconds:
         return CommandValidation(False, "command header stamp did not increase for this hand")
 
-    timeout_nanoseconds = seconds_to_nanoseconds(timeout_sec, "timeout_sec")
     future_tolerance_nanoseconds = seconds_to_nanoseconds(
         future_tolerance_sec, "future_tolerance_sec", allow_zero=True
     )
-    if now_nanoseconds - stamp_nanoseconds > timeout_nanoseconds:
-        return CommandValidation(False, "command header stamp is stale")
     if stamp_nanoseconds - now_nanoseconds > future_tolerance_nanoseconds:
         return CommandValidation(False, "command header stamp is in the future")
     return CommandValidation(True, "", normalized)
@@ -169,27 +165,29 @@ def is_fresh(receipt_monotonic: float | None, now_monotonic: float, timeout_sec:
     return now_monotonic - receipt_monotonic <= timeout_sec
 
 
-def slew_toward(
-    current: Sequence[float], target: Sequence[float], max_step: float
+def smooth_toward(
+    current: Sequence[float],
+    target: Sequence[float],
+    elapsed_sec: float,
+    smoothing_time_sec: float,
 ) -> tuple[float, ...]:
-    """Move each joint no more than ``max_step`` radians toward its target."""
+    """Approach the latest target exponentially, without a velocity or step limit."""
     if len(current) != len(target):
-        raise ValueError("cannot slew vectors with different lengths")
-    if not math.isfinite(max_step) or max_step < 0.0:
-        raise ValueError("max_step must be a finite non-negative value")
-
+        raise ValueError("cannot smooth vectors with different lengths")
+    if not math.isfinite(elapsed_sec) or elapsed_sec < 0.0:
+        raise ValueError("elapsed_sec must be finite and non-negative")
+    if not math.isfinite(smoothing_time_sec) or smoothing_time_sec <= 0.0:
+        raise ValueError("smoothing_time_sec must be finite and positive")
+    alpha = -math.expm1(-elapsed_sec / smoothing_time_sec)
     result: list[float] = []
     for current_value, target_value in zip(current, target):
         current_float = float(current_value)
         target_float = float(target_value)
         if not math.isfinite(current_float) or not math.isfinite(target_float):
-            raise ValueError("cannot slew a non-finite joint position")
-        delta = target_float - current_float
-        if delta > max_step:
-            delta = max_step
-        elif delta < -max_step:
-            delta = -max_step
-        result.append(current_float + delta)
+            raise ValueError("cannot smooth a non-finite joint position")
+        # Convex interpolation preserves joint bounds and never overshoots.
+        position = (1.0 - alpha) * current_float + alpha * target_float
+        result.append(min(max(current_float, target_float), max(min(current_float, target_float), position)))
     return tuple(result)
 
 

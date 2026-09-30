@@ -1,4 +1,5 @@
 """Load the vendor's dual-hand dynamics without modifying or copying its assets."""
+import math
 from pathlib import Path
 from xml.etree import ElementTree as ET
 
@@ -11,9 +12,15 @@ SIDES = ("left", "right")
 
 
 class HandSimulation:
-    def __init__(self, models_root: str):
+    def __init__(self, models_root: str, timestep_sec: float = 0.002):
         if not models_root:
             raise ValueError("models_root is required; set SHARPA_MODELS")
+        try:
+            timestep_sec = float(timestep_sec)
+        except (TypeError, ValueError) as error:
+            raise ValueError("timestep_sec must be numeric") from error
+        if not math.isfinite(timestep_sec) or timestep_sec <= 0.0:
+            raise ValueError("timestep_sec must be finite and positive")
         wave = Path(models_root).expanduser().resolve() / "wave_01"
         scene_path = wave / "dual_sharpa_wave/dual_sharpa_wave.xml"
         tree = ET.parse(scene_path)
@@ -52,7 +59,7 @@ class HandSimulation:
         option = scene.find("option")
         if option is None:
             option = ET.SubElement(scene, "option")
-        option.set("timestep", "0.002")
+        option.set("timestep", f"{timestep_sec:.17g}")
         option.set("integrator", "implicitfast")
         world = scene.find("worldbody")
         ET.SubElement(world, "light", pos="1 -1 2", dir="-1 1 -2", diffuse="0.8 0.8 0.8")
@@ -91,12 +98,11 @@ class HandSimulation:
         positions, reason = self.joints[side].validate(names, positions)
         if positions is None:
             raise ValueError(reason)
-        self.data.ctrl[self.actuator_ids[side]] = positions
+        self.set_positions(side, positions)
 
-    def hold(self, side):
-        joints = self.joints[side]
-        self.data.ctrl[self.actuator_ids[side]] = np.clip(
-            self.data.qpos[self.qpos_ids[side]], joints.lower, joints.upper)
+    def set_positions(self, side, positions):
+        """Set position-actuator targets that were already validated at the ROS boundary."""
+        self.data.ctrl[self.actuator_ids[side]] = positions
 
     def step(self):
         previous_time = self.data.time

@@ -107,7 +107,6 @@ def main():
             for side in ("left", "right"):
                 for name, topic, kind, shape in (
                     ("manus_raw", f"/manus/{side}/raw_poses", PoseArray, (25, 7)),
-                    ("manus_input", f"/manus/{side}/poses", PoseArray, (25, 7)),
                     ("sharpa_joint", f"/sharpa/{side}/command", JointState, (22,)),
                 ):
                     stream = Stream(file, side, name, topic, shape, start_ns)

@@ -26,9 +26,8 @@ from .safety import (
     CommandValidation,
     JointModel,
     header_stamp_nanoseconds,
-    is_fresh,
     load_joint_model,
-    slew_toward,
+    smooth_toward,
     validate_command,
 )
 
@@ -44,10 +43,8 @@ class SdkFailure(RuntimeError):
 class _SideState:
     target: tuple[float, ...] | None = None
     last_header_stamp_ns: int = 0
-    last_receipt_monotonic: float | None = None
     last_sent: tuple[float, ...] | None = None
     last_send_monotonic: float | None = None
-
 
 def _resolve_upstream_root(sdk_root: str) -> Path:
     """Locate the external checkout portion that contains the authoritative URDFs."""
@@ -280,10 +277,10 @@ class NativeSharpaBackend:
                 for side, positions in actual.items():
                     target = targets.get(side)
                     if target is None:
-                        raise SdkFailure(f"no fresh target is available for selected {side} hand")
+                        raise SdkFailure(f"no valid target is available for selected {side} hand")
                     _, reason = self._models[side].validate(self._models[side].names, target)
                     if reason:
-                        raise SdkFailure(f"invalid fresh target for selected {side} hand: {reason}")
+                        raise SdkFailure(f"invalid target for selected {side} hand: {reason}")
                     self.set_positions(side, positions)
                     wave = self._wave(side)
                     _check_sdk_error(
@@ -398,9 +395,8 @@ class SharpaOutput(Node):
         self.declare_parameter("dry_run", True)
         self.declare_parameter("left_serial", "")
         self.declare_parameter("right_serial", "")
-        self.declare_parameter("timeout_sec", 0.5)
         self.declare_parameter("future_tolerance_sec", 0.0)
-        self.declare_parameter("max_velocity", 1.0)
+        self.declare_parameter("smoothing_time_sec", 0.02)
         self.declare_parameter("control_hz", 500.0)
         self.declare_parameter("feedback_hz", 30.0)
         self.declare_parameter("startup_timeout_sec", 5.0)
@@ -412,9 +408,8 @@ class SharpaOutput(Node):
         self._sdk_root = ""
         self._dry_run = True
         self._serials = {"left": "", "right": ""}
-        self._timeout_sec = 0.5
         self._future_tolerance_sec = 0.0
-        self._max_velocity = 1.0
+        self._smoothing_time_sec = 0.02
         self._control_hz = 500.0
         self._feedback_hz = 30.0
         self._startup_timeout_sec = 5.0
@@ -436,9 +431,8 @@ class SharpaOutput(Node):
             self._sdk_root = sdk_root
             self._dry_run = dry_run
             self._serials = {"left": left_serial.strip(), "right": right_serial.strip()}
-            self._timeout_sec = float(self.get_parameter("timeout_sec").value)
             self._future_tolerance_sec = float(self.get_parameter("future_tolerance_sec").value)
-            self._max_velocity = float(self.get_parameter("max_velocity").value)
+            self._smoothing_time_sec = float(self.get_parameter("smoothing_time_sec").value)
             self._control_hz = float(self.get_parameter("control_hz").value)
             self._feedback_hz = float(self.get_parameter("feedback_hz").value)
             self._startup_timeout_sec = float(self.get_parameter("startup_timeout_sec").value)
@@ -534,7 +528,7 @@ class SharpaOutput(Node):
         if self._startup_error is None:
             self.get_logger().info(f"Sharpa output ready in {mode} mode; hands start disabled")
             if self._auto_enable_pending:
-                self.get_logger().warning("Automatic enable is pending fresh targets; keep the workspace clear")
+                self.get_logger().warning("Automatic enable is pending valid targets; keep the workspace clear")
         else:
             self.get_logger().warning(
                 f"Sharpa output remains disabled in {mode} mode: {self._startup_error}"
@@ -542,8 +536,7 @@ class SharpaOutput(Node):
 
     def _validate_parameters(self) -> None:
         positive = {
-            "timeout_sec": self._timeout_sec,
-            "max_velocity": self._max_velocity,
+            "smoothing_time_sec": self._smoothing_time_sec,
             "control_hz": self._control_hz,
             "startup_timeout_sec": self._startup_timeout_sec,
             "homing_timeout_sec": self._homing_timeout_sec,
@@ -560,20 +553,13 @@ class SharpaOutput(Node):
     def _required_arm_sides(self) -> tuple[str, ...]:
         return SIDES if self._dry_run else self._hardware_sides
 
-    def _fresh_targets(self) -> tuple[dict[str, tuple[float, ...]] | None, str]:
+    def _available_targets(self) -> tuple[dict[str, tuple[float, ...]] | None, str]:
         with self._target_lock:
-            now_monotonic = time.monotonic()
             targets: dict[str, tuple[float, ...]] = {}
-            now_ns = self.get_clock().now().nanoseconds
             for side in self._required_arm_sides():
                 state = self._states[side]
-                if state.target is None or not is_fresh(
-                    state.last_receipt_monotonic, now_monotonic, self._timeout_sec
-                ):
-                    return None, f"{side} hand has no fresh valid target"
-                age = (now_ns - state.last_header_stamp_ns) / 1_000_000_000
-                if age > self._timeout_sec or age < -self._future_tolerance_sec:
-                    return None, f"{side} hand target source stamp is no longer fresh"
+                if state.target is None:
+                    return None, f"{side} hand has no valid target"
                 targets[side] = state.target
             return targets, ""
 
@@ -584,7 +570,6 @@ class SharpaOutput(Node):
             self.get_logger().warning(f"Rejected {side} command: {exc}")
             return
 
-        receipt_monotonic = time.monotonic()
         now_ns = self.get_clock().now().nanoseconds
         with self._target_lock:
             model = self._models.get(side)
@@ -599,7 +584,6 @@ class SharpaOutput(Node):
                 stamp_ns,
                 state.last_header_stamp_ns,
                 now_ns,
-                self._timeout_sec,
                 self._future_tolerance_sec,
             )
             if not validation.accepted:
@@ -607,7 +591,6 @@ class SharpaOutput(Node):
                 return
             state.target = validation.positions
             state.last_header_stamp_ns = stamp_ns
-            state.last_receipt_monotonic = receipt_monotonic
 
         target = JointState()
         target.header.stamp.sec = message.header.stamp.sec
@@ -636,7 +619,7 @@ class SharpaOutput(Node):
                 response.success = False
                 response.message = f"cannot arm: {self._startup_error}"
                 return response
-            targets, reason = self._fresh_targets()
+            targets, reason = self._available_targets()
             if targets is None:
                 response.success = False
                 response.message = f"cannot arm: {reason}"
@@ -661,8 +644,6 @@ class SharpaOutput(Node):
                 actual = self._backend.arm(targets)
                 if self._stopping.is_set():
                     raise SdkFailure("shutdown requested while arming")
-                if self._fresh_targets()[0] is None:
-                    raise SdkFailure("target expired while arming")
             except SdkFailure as exc:
                 self._trip(f"failed to arm hardware: {exc}")
                 response.success = False
@@ -686,7 +667,7 @@ class SharpaOutput(Node):
                 if self._startup_error is not None:
                     self._auto_enable_pending = False
                     return
-                if self._fresh_targets()[0] is None:
+                if self._available_targets()[0] is None:
                     return
                 response = self._on_enable(SetBool.Request(data=True), SetBool.Response())
                 if response.success:
@@ -697,9 +678,9 @@ class SharpaOutput(Node):
             if not self._armed:
                 return
             now_monotonic = time.monotonic()
-            targets, reason = self._fresh_targets()
+            targets, reason = self._available_targets()
             if targets is None:
-                self._trip(f"command watchdog expired: {reason}")
+                self._trip(f"armed output has no valid target: {reason}")
                 return
             if self._dry_run:
                 return
@@ -714,10 +695,10 @@ class SharpaOutput(Node):
                         raise SdkFailure(f"{side} hand has no measured arm position")
                     previous_send = state.last_send_monotonic
                     elapsed = 0.0 if previous_send is None else max(0.0, now_monotonic - previous_send)
-                    max_step = self._max_velocity * min(elapsed, 1.0 / self._control_hz)
-                    next_position = slew_toward(state.last_sent, target, max_step)
-                    # Stream each control tick, including a reached target.
-                    # Only incoming commands refresh the input watchdog.
+                    next_position = smooth_toward(
+                        state.last_sent, target, elapsed, self._smoothing_time_sec
+                    )
+                    # Stream every control tick, including an already-reached target.
                     self._backend.set_positions(side, next_position)
                     state.last_sent = next_position
                     state.last_send_monotonic = now_monotonic
@@ -768,7 +749,7 @@ class SharpaOutput(Node):
             return False
 
     def _return_to_zero(self) -> None:
-        """Slew the healthy, already-enabled hand to zero, then verify measured arrival."""
+        """Smooth the healthy, already-enabled hand to zero, then verify measured arrival."""
         if self._backend is None:
             raise SdkFailure("cannot return to zero without a hardware backend")
         zeros = {side: (0.0,) * 22 for side in self._hardware_sides}
@@ -777,7 +758,7 @@ class SharpaOutput(Node):
             _, reason = self._models[side].validate(self._models[side].names, zero)
             if reason:
                 raise SdkFailure(f"invalid zero pose for {side}: {reason}")
-            # Continue the existing bounded trajectory; never jump the current setpoint.
+            # Begin from the existing command so return-to-zero never jumps the setpoint.
             measured = self._backend.read_positions(side)
             commanded[side] = self._states[side].last_sent or measured
         deadline = time.monotonic() + self._homing_timeout_sec
@@ -787,14 +768,16 @@ class SharpaOutput(Node):
             now = time.monotonic()
             if now >= deadline:
                 raise SdkFailure("return-to-zero timed out before measured convergence")
-            step = self._max_velocity * min(max(0.0, now - previous), 1.0 / self._control_hz)
+            elapsed = max(0.0, now - previous)
             previous = now
             arrived = True
             for side, zero in zeros.items():
-                commanded[side] = slew_toward(commanded[side], zero, step)
+                commanded[side] = smooth_toward(
+                    commanded[side], zero, elapsed, self._smoothing_time_sec
+                )
                 self._backend.set_positions(side, commanded[side])
                 measured = self._backend.read_positions(side)
-                if commanded[side] != zero or any(abs(value) > self._homing_tolerance_rad for value in measured):
+                if any(abs(value) > self._homing_tolerance_rad for value in measured):
                     arrived = False
             if arrived:
                 self.get_logger().info("Selected hands reached zero; disabling and closing")

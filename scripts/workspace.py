@@ -46,24 +46,36 @@ def main():
   pixi run manus-build       # standalone native build; `manus` does this itself
   pixi run doctor
 
+Raw-keypoint viewer:
+  pixi run rawmanus
+  `rawmanus` builds the ROS workspace and starts a MuJoCo view of the 25
+  native Manus keypoints. By default it also builds and starts the project
+  native producer, but never starts retargeting, simulation, or hardware
+  output.
+
+  To view an existing raw ROS producer without a second Manus SDK connection:
+  pixi run rawmanus with_client:=false
+  This mode starts only the viewer and does not build or validate the Manus SDK.
+
 Producer terminal:
   pixi run manus
   `manus` builds the ROS workspace and project-native `manus_ros`, then starts
-  it with the raw-pose resampler and retargeter. `manus_ros` publishes
-  /manus/{left,right}/raw_poses and `manus_input` resamples them to
-  /manus/{left,right}/poses. It needs a MANUS SDK-component license, paired
-  gloves, and operator calibration. Do not run another MANUS Core/Integrated
-  instance concurrently.
+  it with the direct raw-pose retargeter. `manus_ros` publishes
+  /manus/{left,right}/raw_poses at its actual SDK callback rate, and `retarget`
+  subscribes to those topics directly. It needs a MANUS SDK-component license,
+  paired gloves, and operator calibration. Do not run another MANUS
+  Core/Integrated instance concurrently.
 
   To use an existing raw ROS publisher, omit only the managed native adapter:
   pixi run manus with_client:=false
-  The external publisher must provide 25-pose geometry_msgs/PoseArray messages
-  on /manus/{left,right}/raw_poses in the same ROS domain.
+  This mode starts only the retargeter. The external publisher must provide
+  25-pose geometry_msgs/PoseArray messages on /manus/{left,right}/raw_poses in
+  the same ROS domain.
 
 Consumer terminal:
   pixi run sim
   `sim` consumes /sharpa/{left,right}/command, runs MuJoCo, and publishes only
-  /sim/sharpa/{left,right}/joint_states. It does not start Manus input or
+  /sim/sharpa/{left,right}/joint_states. It does not start native capture or
   retargeting and does not load the native hardware SDK.
 
 Real output:
@@ -71,27 +83,29 @@ Real output:
   Terminal 2: pixi run real          # Both hands
               pixi run real left     # Left hand only
               pixi run real right    # Right hand only
-  `real` consumes /sharpa/{left,right}/command directly and starts only the
-  native safety output; it does not launch MuJoCo. Default serials are
-  left=C55C9039C55F and right=CC549038CC57. It waits for fresh targets for
-  every selected hand, then auto-enables once. Override selected serials after
-  the optional side, for example: pixi run real left left_serial:=LEFT_SN
+  `real` consumes /sharpa/{left,right}/command directly, independently smooths
+  each hand toward its latest valid target, and starts only the native safety
+  output; it does not launch MuJoCo. A source dropout keeps smoothing toward
+  the last valid target. Default serials are left=C55C9039C55F and
+  right=CC549038CC57. It waits for valid targets for every selected hand, then
+  auto-enables once. Override selected serials after the optional side, for
+  example: pixi run real left left_serial:=LEFT_SN
 
 Shutdown and safety:
-  On Ctrl+C/SIGTERM, a healthy armed real output slews selected joints to 0 rad
-  then disables. SIGKILL, power loss, and a faulted/stale output cannot perform
-  that cleanup; faults and stale input never auto-rearm. /sharpa/enable remains
+  On Ctrl+C/SIGTERM, a healthy armed real output smoothly returns selected
+  joints to 0 rad then disables. SIGKILL, power loss, and a faulted output
+  cannot perform that cleanup; faults never auto-rearm. /sharpa/enable remains
   an optional debug/recovery service, not a normal startup step.
 
 Independent launch arguments:
   pixi run manus [config/sdk_root/calibration_dir/worker_python/with_client/project_root arguments]
+  pixi run rawmanus [sdk_root/calibration_dir/with_client/project_root arguments]
   pixi run sim [config/models_root/headless arguments]
   pixi run real [config/sdk_root/native_sdk_root/safety/serial arguments]
   Configuration: src/sharpa_teleop/config/sim.yaml and teleop.yaml
 
 Topics:
   /manus/{left,right}/raw_poses     geometry_msgs/PoseArray, 25 native poses
-  /manus/{left,right}/poses         geometry_msgs/PoseArray, 25 resampled poses
   /sharpa/{left,right}/command      sensor_msgs/JointState, 22 radians
   /sharpa/{left,right}/joint_states native measured feedback, hardware only
   /sim/sharpa/{left,right}/joint_states simulated positions/velocities, radians
@@ -112,7 +126,7 @@ Safety:
   V4.0 may report shared-memory resource-tracker warnings on worker exit.
 """,
     )
-    parser.add_argument("action", choices=["build", "manus", "sim", "real", "doctor"])
+    parser.add_argument("action", choices=["build", "manus", "rawmanus", "sim", "real", "doctor"])
     args, extra = parser.parse_known_args()
     if args.action == "build":
         subprocess.run(["colcon", "build", "--symlink-install", "--base-paths", "src", *extra], cwd=ROOT, check=True)
@@ -122,6 +136,27 @@ Safety:
         configured_sdk_root = _launch_argument(extra, "sdk_root")
         sdk_root(configured_sdk_root) if configured_sdk_root is not None else sdk_root()
         launch_file = "manus.launch.py"
+        launch_args = [f"project_root:={ROOT}", *extra]
+    elif args.action == "rawmanus":
+        configured_sdk_root = _launch_argument(extra, "sdk_root")
+        with_client_value = _launch_argument(extra, "with_client")
+        if with_client_value is None:
+            start_client = True
+        else:
+            normalized_with_client = with_client_value.strip().lower()
+            if normalized_with_client not in {"true", "false", "1", "0"}:
+                parser.error("rawmanus with_client must be true, false, 1, or 0")
+            start_client = normalized_with_client in {"true", "1"}
+        if start_client:
+            native_build = [
+                sys.executable,
+                str(ROOT / "scripts" / "manus_client.py"),
+                "build",
+            ]
+            if configured_sdk_root is not None:
+                native_build.extend(["--sdk-root", configured_sdk_root])
+            subprocess.run(native_build, cwd=ROOT, check=True)
+        launch_file = "rawmanus.launch.py"
         launch_args = [f"project_root:={ROOT}", *extra]
     elif args.action == "sim":
         launch_file = "sim.launch.py"

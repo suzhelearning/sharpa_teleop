@@ -16,7 +16,6 @@ import sys
 import threading
 import time
 import traceback
-from functools import partial
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -292,7 +291,6 @@ def _enqueue_request(
 
 def run(sdk_root: str, protocol: TextIO) -> int:
     manager: Any | None = None
-    initialized: Any | None = None
     protocol_lock = threading.Lock()
     requests_by_side = {side: queue.Queue(maxsize=1) for side in _SIDES}
     solver_threads: list[threading.Thread] = []
@@ -303,28 +301,9 @@ def run(sdk_root: str, protocol: TextIO) -> int:
         hand_models = init_hand_model("WAVE")
         names_by_side = _validate_models(hand_models)
         manager = manager_type(hand_models, filter_alpha=0.2, hand_serial="WAVE")
-        from sharpa_teleop.retarget_solver import optimized_worker
-        import hand_retargeting_optimizer as vendor
-
-        initialized = mp.Queue()
-        original_worker = vendor.optimization_worker_multiprocess
-        vendor.optimization_worker_multiprocess = partial(optimized_worker, sdk_root, initialized)
-        try:
-            manager.start()
-        finally:
-            vendor.optimization_worker_multiprocess = original_worker
-        # Compile both objectives before READY, not while processing a fresh
-        # pose. The SDK's start() alone does not wait for child initialization.
-        waiting = set(_SIDES)
-        deadline = time.monotonic() + 60.0
-        while waiting:
-            try:
-                side, error = initialized.get(timeout=max(0.001, deadline - time.monotonic()))
-            except queue.Empty as error:
-                raise TimeoutError("Timed out compiling retarget objectives") from error
-            if error is not None:
-                raise RuntimeError(f"{side} optimizer startup failed: {error}")
-            waiting.discard(side)
+        # Use the SDK's original IPOPT workers without replacing its solver.
+        # _process_request waits for actual completion before publishing results.
+        manager.start()
         for side in _SIDES:
             thread = threading.Thread(
                 target=_solve_requests,
@@ -366,9 +345,6 @@ def run(sdk_root: str, protocol: TextIO) -> int:
             thread.join()
         if manager is not None:
             _shutdown_manager(manager)
-        if initialized is not None:
-            initialized.close()
-            initialized.join_thread()
 
 
 def main(argv: list[str] | None = None) -> int:

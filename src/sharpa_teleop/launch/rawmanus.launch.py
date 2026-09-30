@@ -1,8 +1,7 @@
-"""Launch the local Manus ROS adapter and direct raw-pose retargeter."""
+"""Launch a live viewer for unretargeted Manus raw keypoints."""
 import os
 import sys
 
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, EmitEvent, ExecuteProcess, RegisterEventHandler
 from launch.conditions import IfCondition
@@ -10,23 +9,17 @@ from launch.event_handlers import OnProcessExit
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
     defaults = {
-        "config": os.path.join(get_package_share_directory("sharpa_teleop"), "config", "teleop.yaml"),
         "sdk_root": os.environ.get("SHARPA_MANUS_SDK", ""),
         "calibration_dir": os.environ.get("SHARPA_MANUS_CALIBRATION_DIR", ""),
-        "worker_python": os.environ.get("RETARGET_PYTHON", ""),
         "with_client": "true",
         # workspace.py supplies ROOT explicitly; this supports direct Pixi launch too.
         "project_root": os.environ.get("PIXI_PROJECT_ROOT", os.getcwd()),
     }
     arguments = [DeclareLaunchArgument(key, default_value=value) for key, value in defaults.items()]
-
-    def parameter(key, kind=str):
-        return ParameterValue(LaunchConfiguration(key), value_type=kind)
 
     native_client = ExecuteProcess(
         cmd=[
@@ -42,27 +35,24 @@ def generate_launch_description():
         cwd=LaunchConfiguration("project_root"),
         output="screen",
     )
-    retarget = Node(
+    viewer = Node(
         package="sharpa_teleop",
-        executable="retarget",
-        name="retarget",
+        executable="raw_manus",
+        name="raw_manus",
         output="screen",
-        parameters=[
-            LaunchConfiguration("config"),
-            {
-                "sdk_root": parameter("sdk_root"),
-                "worker_python": parameter("worker_python"),
-            },
-        ],
     )
-    producers = [native_client, retarget]
-    shutdown_handlers = [
-        RegisterEventHandler(
-            OnProcessExit(
-                target_action=producer,
-                on_exit=[EmitEvent(event=Shutdown(reason="Manus producer process exited"))],
-            )
+    viewer_exit = RegisterEventHandler(
+        OnProcessExit(
+            target_action=viewer,
+            on_exit=[EmitEvent(event=Shutdown(reason="Raw Manus viewer exited"))],
         )
-        for producer in producers
-    ]
-    return LaunchDescription(arguments + shutdown_handlers + producers)
+    )
+    native_client_exit = RegisterEventHandler(
+        OnProcessExit(
+            target_action=native_client,
+            on_exit=[EmitEvent(event=Shutdown(reason="Raw Manus native producer exited"))],
+        )
+    )
+    return LaunchDescription(
+        arguments + [viewer_exit, native_client_exit, native_client, viewer]
+    )

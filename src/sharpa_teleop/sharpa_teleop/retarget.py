@@ -1,4 +1,4 @@
-"""Retarget validated Manus PoseArrays through the external Python 3.10 worker."""
+"""Retarget native Manus PoseArrays through the external Python 3.10 worker."""
 
 from __future__ import annotations
 from collections import deque
@@ -23,11 +23,14 @@ from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPo
 from rclpy.signals import SignalHandlerOptions
 from sensor_msgs.msg import JointState
 
+from .safety import NANOSECONDS_PER_SECOND, header_stamp_nanoseconds
+
+
 
 _HAND_SIZE = 25
 _JOINT_COUNT = 22
 _SIDES = ("left", "right")
-_INPUT_HISTORY = 4
+_PENDING_CAPACITY = 4
 
 
 def _best_effort_qos(depth: int = 1) -> QoSProfile:
@@ -43,15 +46,13 @@ def _best_effort_qos(depth: int = 1) -> QoSProfile:
 class _Frame:
     side: str
     number: int
-    stamp_sec: int
-    stamp_nanosec: int
+    stamp_nanoseconds: int
     frame_id: str
-    received_at: float
     points: list[list[float]]
 
 
 class Retarget(Node):
-    """Buffer short scheduling jitter while independently solving each hand."""
+    """Solve each validated native Manus pose independently."""
 
     def __init__(self) -> None:
         super().__init__("retarget")
@@ -61,27 +62,33 @@ class Retarget(Node):
         self._worker_python = str(
             self.declare_parameter("worker_python", os.environ.get("RETARGET_PYTHON", "")).value
         )
-        self._timeout_sec = float(self.declare_parameter("timeout_sec", 0.5).value)
+        self._startup_timeout_sec = self._positive_timeout_parameter(
+            "startup_timeout_sec", 60.0
+        )
+        self._response_timeout_sec = self._positive_timeout_parameter(
+            "response_timeout_sec", 0.5
+        )
         if not self._sdk_root.strip():
             raise RuntimeError("sdk_root is empty; set SHARPA_MANUS_SDK or the sdk_root parameter")
         if not self._worker_python.strip():
             raise RuntimeError(
                 "worker_python is empty; set RETARGET_PYTHON to the Python 3.10 retarget interpreter"
             )
-        if not math.isfinite(self._timeout_sec) or self._timeout_sec <= 0.0:
-            raise RuntimeError("timeout_sec must be a finite positive number")
 
         self._state_lock = threading.Lock()
         self._dispatch_condition = threading.Condition(self._state_lock)
         self._stdin_lock = threading.Lock()
-        # Absorb short scheduling bursts at 250 Hz without growing unbounded
-        # latency. Overload still discards the oldest waiting pose.
-        self._pending: dict[str, deque[_Frame]] = {side: deque(maxlen=_INPUT_HISTORY) for side in _SIDES}
+        # Bound queued solver work; overload discards the oldest waiting pose
+        # instead of accumulating latency.
+        self._pending: dict[str, deque[_Frame]] = {
+            side: deque(maxlen=_PENDING_CAPACITY) for side in _SIDES
+        }
         self._sequence = {side: 0 for side in _SIDES}
         # The upstream manager has independent left/right shared-memory state, so
         # one genuine solve may be outstanding for each side at a time.
         self._active: dict[str, _Frame | None] = {side: None for side in _SIDES}
-        self._active_expired: dict[str, bool] = {side: False for side in _SIDES}
+        self._active_started_at: dict[str, float | None] = {side: None for side in _SIDES}
+        self._last_source_stamp_ns = {side: 0 for side in _SIDES}
         self._fatal_error: str | None = None
         self._startup_error: str | None = None
         self._ready_received = False
@@ -103,11 +110,11 @@ class Retarget(Node):
                 side: self.create_publisher(JointState, f"/sharpa/{side}/command", qos)
                 for side in _SIDES
             }
-            input_qos = _best_effort_qos(depth=_INPUT_HISTORY)
+            input_qos = _best_effort_qos(depth=_PENDING_CAPACITY)
             self._hand_subscriptions = [
                 self.create_subscription(
                     PoseArray,
-                    f"/manus/{side}/poses",
+                    f"/manus/{side}/raw_poses",
                     lambda message, side=side: self._on_pose_array(side, message),
                     input_qos,
                 )
@@ -130,6 +137,18 @@ class Retarget(Node):
     def fatal_error(self) -> str | None:
         with self._state_lock:
             return self._fatal_error
+
+    def _positive_timeout_parameter(self, name: str, default: float) -> float:
+        raw_value = self.declare_parameter(name, default).value
+        if isinstance(raw_value, bool):
+            raise RuntimeError(f"{name} must be a finite positive number")
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError) as error:
+            raise RuntimeError(f"{name} must be a finite positive number") from error
+        if not math.isfinite(value) or value <= 0.0:
+            raise RuntimeError(f"{name} must be a finite positive number")
+        return value
 
     def _warn(self, key: str, message: str) -> None:
         now = time.monotonic()
@@ -178,11 +197,9 @@ class Retarget(Node):
         self._stderr_thread.start()
 
     def _wait_for_worker_ready(self) -> None:
-        # Solver process creation can exceed a single frame's result timeout.
-        startup_timeout = max(60.0, self._timeout_sec)
-        if not self._ready_event.wait(startup_timeout):
+        if not self._ready_event.wait(self._startup_timeout_sec):
             self._set_fatal_error(
-                f"Retarget worker did not send READY within {startup_timeout:.1f} seconds",
+                f"Retarget worker did not send READY within {self._startup_timeout_sec:.1f} seconds",
                 startup=True,
             )
         with self._state_lock:
@@ -272,7 +289,7 @@ class Retarget(Node):
                 active = self._active[side]
                 if active is not None and active.number == frame:
                     self._active[side] = None
-                    self._active_expired[side] = False
+                    self._active_started_at[side] = None
                     self._dispatch_condition.notify_all()
         self.get_logger().error(
             f"Retarget worker rejected {side!r} frame {frame!r} during {stage!r}: {detail}"
@@ -306,26 +323,28 @@ class Retarget(Node):
         command = JointState()
         command.name = names
         command.position = [float(value) for value in positions]
-        rejected = False
+        unexpected_result = False
         with self._dispatch_condition:
             if self._stopping.is_set() or self._fatal_error is not None:
                 return
             active = self._active[side]
             if active is None or active.number != frame:
-                rejected = True
+                unexpected_result = True
             else:
                 self._active[side] = None
-                expired = self._active_expired[side]
-                self._active_expired[side] = False
+                self._active_started_at[side] = None
                 self._dispatch_condition.notify_all()
-                if expired or time.monotonic() - active.received_at > self._timeout_sec:
-                    rejected = True
-                else:
-                    command.header.stamp = Time(sec=active.stamp_sec, nanosec=active.stamp_nanosec)
-                    command.header.frame_id = active.frame_id
+                command.header.stamp = Time(
+                    sec=active.stamp_nanoseconds // NANOSECONDS_PER_SECOND,
+                    nanosec=active.stamp_nanoseconds % NANOSECONDS_PER_SECOND,
+                )
+                command.header.frame_id = active.frame_id
 
-        if rejected:
-            self._warn("stale-result", f"Rejected stale retarget result for {side} frame {frame}")
+        if unexpected_result:
+            self._warn(
+                "unexpected-result",
+                f"Ignored unexpected retarget result for {side} frame {frame}",
+            )
             return
         self._hand_publishers[side].publish(command)
 
@@ -341,90 +360,110 @@ class Retarget(Node):
         self.get_logger().error(f"Retarget worker failure: {message}")
 
     def _on_pose_array(self, side: str, message: PoseArray) -> None:
+        now_nanoseconds = self.get_clock().now().nanoseconds
         try:
+            source_stamp_nanoseconds = header_stamp_nanoseconds(message.header.stamp)
+            frame_id = str(message.header.frame_id)
             points = self._pose_array_to_points(message)
-        except ValueError as error:
-            self._warn(side, f"Rejected invalid /manus/{side}/poses frame: {error}")
+        except (AttributeError, OverflowError, TypeError, ValueError) as error:
+            self._warn(side, f"Rejected invalid /manus/{side}/raw_poses frame: {error}")
             return
-        if points is None:
-            return
-        stamp_sec = int(message.header.stamp.sec)
-        stamp_nanosec = int(message.header.stamp.nanosec)
-        frame_id = str(message.header.frame_id)
-        received_at = time.monotonic()
+
         worker_unavailable = False
+        source_rejection: str | None = None
         with self._dispatch_condition:
-            if self._stopping.is_set() or self._fatal_error is not None:
+            if source_stamp_nanoseconds <= 0:
+                source_rejection = "a non-positive source timestamp"
+            elif source_stamp_nanoseconds <= self._last_source_stamp_ns[side]:
+                source_rejection = "a non-increasing source timestamp"
+            elif source_stamp_nanoseconds > now_nanoseconds:
+                source_rejection = "a future source timestamp"
+            elif self._stopping.is_set() or self._fatal_error is not None:
                 worker_unavailable = True
             else:
+                self._last_source_stamp_ns[side] = source_stamp_nanoseconds
                 self._sequence[side] += 1
                 frame = _Frame(
                     side=side,
                     number=self._sequence[side],
-                    stamp_sec=stamp_sec,
-                    stamp_nanosec=stamp_nanosec,
+                    stamp_nanoseconds=source_stamp_nanoseconds,
                     frame_id=frame_id,
-                    received_at=received_at,
                     points=points,
                 )
                 self._pending[side].append(frame)
                 self._dispatch_condition.notify_all()
-        if worker_unavailable:
+        if source_rejection is not None:
+            self._warn(
+                f"{side}-source-time",
+                f"Rejected Manus {side} raw pose with {source_rejection}",
+            )
+        elif worker_unavailable:
             self._warn("worker-unavailable", "Dropping Manus poses because the retarget worker failed")
 
     @staticmethod
-    def _pose_array_to_points(message: PoseArray) -> list[list[float]] | None:
+    def _pose_array_to_points(message: PoseArray) -> list[list[float]]:
         if len(message.poses) != _HAND_SIZE:
             raise ValueError(f"expected {_HAND_SIZE} poses, received {len(message.poses)}")
 
         points: list[list[float]] = []
         for pose in message.poses:
-            point = [
-                float(pose.position.x),
-                float(pose.position.y),
-                float(pose.position.z),
-                float(pose.orientation.w),
-                float(pose.orientation.x),
-                float(pose.orientation.y),
-                float(pose.orientation.z),
-            ]
-            if not all(math.isfinite(value) for value in point):
+            x = float(pose.position.x)
+            y = float(pose.position.y)
+            z = float(pose.position.z)
+            w = float(pose.orientation.w)
+            qx = float(pose.orientation.x)
+            qy = float(pose.orientation.y)
+            qz = float(pose.orientation.z)
+            if not all(math.isfinite(value) for value in (x, y, z, w, qx, qy, qz)):
                 raise ValueError("contains a non-finite pose value")
-            points.append(point)
-        if all(value == 0.0 for point in points for value in point):
-            return None
-        if any(sum(component * component for component in point[3:]) == 0.0 for point in points):
-            raise ValueError("contains a zero quaternion")
+            quaternion_norm = math.hypot(w, qx, qy, qz)
+            if not math.isfinite(quaternion_norm) or quaternion_norm == 0.0:
+                raise ValueError("contains a non-normalizable quaternion")
+            inverse_norm = 1.0 / quaternion_norm
+            points.append(
+                [x, y, z, w * inverse_norm, qx * inverse_norm, qy * inverse_norm, qz * inverse_norm]
+            )
         return points
 
 
     def _dispatch_loop(self) -> None:
         while True:
             frames_to_send: list[_Frame] = []
-            warnings: list[tuple[str, str]] = []
+            deadlock_error: str | None = None
             with self._dispatch_condition:
                 while True:
                     if self._stopping.is_set() or self._fatal_error is not None:
                         return
 
                     now = time.monotonic()
-                    next_timeout: float | None = None
+                    next_response_timeout: float | None = None
                     for side in _SIDES:
                         active = self._active[side]
-                        if active is None or self._active_expired[side]:
+                        if active is None:
                             continue
-                        remaining = self._timeout_sec - (now - active.received_at)
-                        if remaining <= 0.0:
-                            self._active_expired[side] = True
-                            warnings.append(
-                                (
-                                    "result-timeout",
-                                    f"Retarget result for {active.side} frame {active.number} "
-                                    "exceeded timeout_sec",
-                                )
+                        started_at = self._active_started_at[side]
+                        if started_at is None:
+                            deadlock_error = (
+                                f"Retarget worker lost the response deadline for {active.side} "
+                                f"frame {active.number}"
                             )
-                        elif next_timeout is None or remaining < next_timeout:
-                            next_timeout = remaining
+                            break
+                        remaining = self._response_timeout_sec - (now - started_at)
+                        if remaining <= 0.0:
+                            deadlock_error = (
+                                f"Retarget worker did not respond to {active.side} frame "
+                                f"{active.number} within response_timeout_sec="
+                                f"{self._response_timeout_sec:g}"
+                            )
+                            break
+                        if (
+                            next_response_timeout is None
+                            or remaining < next_response_timeout
+                        ):
+                            next_response_timeout = remaining
+
+                    if deadlock_error is not None:
+                        break
 
                     for side in _SIDES:
                         if self._active[side] is not None:
@@ -433,24 +472,17 @@ class Retarget(Node):
                         if not pending:
                             continue
                         frame = pending.popleft()
-                        if now - frame.received_at > self._timeout_sec:
-                            warnings.append(
-                                (
-                                    "input-timeout",
-                                    f"Dropped stale queued {frame.side} frame {frame.number}",
-                                )
-                            )
-                            continue
                         self._active[side] = frame
-                        self._active_expired[side] = False
+                        self._active_started_at[side] = now
                         frames_to_send.append(frame)
 
-                    if frames_to_send or warnings:
+                    if frames_to_send:
                         break
-                    self._dispatch_condition.wait(timeout=next_timeout)
+                    self._dispatch_condition.wait(timeout=next_response_timeout)
 
-            for key, message in warnings:
-                self._warn(key, message)
+            if deadlock_error is not None:
+                self._set_fatal_error(deadlock_error)
+                return
             for frame in frames_to_send:
                 self._send_frame(frame)
 
@@ -468,7 +500,7 @@ class Retarget(Node):
             with self._dispatch_condition:
                 if self._active[frame.side] is frame:
                     self._active[frame.side] = None
-                    self._active_expired[frame.side] = False
+                    self._active_started_at[frame.side] = None
                     self._dispatch_condition.notify_all()
             self._set_fatal_error(f"Failed to send retarget frame to worker: {error}")
 
@@ -480,8 +512,8 @@ class Retarget(Node):
             return
         if self._monitor_timer is not None:
             self._monitor_timer.cancel()
-        # A worker failure is fatal to this node: keep launch supervision informed
-        # instead of publishing a replacement mapping or stale command.
+        # A worker failure is fatal to this node; keep launch supervision informed
+        # instead of publishing a replacement mapping or synthetic command.
         try:
             self.context.shutdown()
         except Exception:

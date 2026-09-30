@@ -21,6 +21,8 @@ def generate_launch_description():
         "return_to_zero_on_exit": "true",
         "homing_timeout_sec": "10.0",
         "homing_tolerance_rad": "0.02",
+        "smoothing_time_sec": "0.02",
+        "control_hz": "500.0",
         "left_serial": "",
         "right_serial": "",
     }
@@ -44,6 +46,8 @@ def generate_launch_description():
                 "return_to_zero_on_exit": parameter("return_to_zero_on_exit", bool),
                 "homing_timeout_sec": parameter("homing_timeout_sec", float),
                 "homing_tolerance_rad": parameter("homing_tolerance_rad", float),
+                "smoothing_time_sec": parameter("smoothing_time_sec", float),
+                "control_hz": parameter("control_hz", float),
                 "left_serial": parameter("left_serial"),
                 "right_serial": parameter("right_serial"),
             },

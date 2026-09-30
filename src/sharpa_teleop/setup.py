@@ -13,7 +13,7 @@ setup(
     maintainer="Fcl", maintainer_email="58226448@qq.com",
     description="Manus to SharpaWave ROS 2 teleoperation", license="Proprietary",
     entry_points={"console_scripts": [
-        "manus_input = sharpa_teleop.manus_input:main",
+        "raw_manus = sharpa_teleop.raw_manus:main",
         "retarget = sharpa_teleop.retarget:main",
         "sharpa_output = sharpa_teleop.sharpa_output:main",
         "mujoco_sim = sharpa_teleop.mujoco_sim:main",

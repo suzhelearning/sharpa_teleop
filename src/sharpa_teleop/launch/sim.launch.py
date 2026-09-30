@@ -14,14 +14,23 @@ def generate_launch_description():
     defaults = {
         "models_root": os.environ.get("SHARPA_MODELS", ""),
         "headless": "false",
+        "smoothing_time_sec": "0.02",
+        "control_hz": "500.0",
+        "feedback_hz": "30.0",
         "config": os.path.join(get_package_share_directory("sharpa_teleop"), "config", "sim.yaml"),
     }
     arguments = [DeclareLaunchArgument(key, default_value=value) for key, value in defaults.items()]
+
+    def parameter(key, kind=str):
+        return ParameterValue(LaunchConfiguration(key), value_type=kind)
     simulation = Node(
         package="sharpa_teleop", executable="mujoco_sim", name="mujoco_sim", output="screen",
         parameters=[LaunchConfiguration("config"), {
-            "models_root": ParameterValue(LaunchConfiguration("models_root"), value_type=str),
-            "headless": ParameterValue(LaunchConfiguration("headless"), value_type=bool),
+            "models_root": parameter("models_root"),
+            "headless": parameter("headless", bool),
+            "smoothing_time_sec": parameter("smoothing_time_sec", float),
+            "control_hz": parameter("control_hz", float),
+            "feedback_hz": parameter("feedback_hz", float),
         }],
     )
     shutdown = RegisterEventHandler(OnProcessExit(

@@ -42,6 +42,7 @@ class FakeLifecycleBackend:
         *,
         initial_position: float = 0.3,
         stuck: bool = False,
+        fail_arm: bool = False,
         fail_read_at: int | None = None,
         fail_set_at: int | None = None,
     ) -> None:
@@ -49,6 +50,7 @@ class FakeLifecycleBackend:
         self._position = (initial_position,) * JOINT_COUNT
         self._pending_position: tuple[float, ...] | None = None
         self._stuck = stuck
+        self._fail_arm = fail_arm
         self._fail_read_at = fail_read_at
         self._fail_set_at = fail_set_at
         self.arm_calls = 0
@@ -67,8 +69,10 @@ class FakeLifecycleBackend:
     def arm(self, targets: dict[str, tuple[float, ...]]) -> dict[str, tuple[float, ...]]:
         self.arm_calls += 1
         self.arm_targets.append(dict(targets))
-        self.enabled = True
         self.sequence.append("arm")
+        if self._fail_arm:
+            raise SdkFailure("simulated arm failure")
+        self.enabled = True
         return {"left": self._position}
 
     def read_positions(self, side: str) -> tuple[float, ...]:
@@ -142,9 +146,8 @@ class OutputLifecycleTests(unittest.TestCase):
                 "-p", f"sdk_root:={self._sdk_root}",
                 "-p", "dry_run:=false",
                 "-p", "left_serial:=LIFECYCLE_LEFT",
-                "-p", "timeout_sec:=0.5",
-                "-p", "max_velocity:=1.0",
-                "-p", "control_hz:=10.0",
+                "-p", "smoothing_time_sec:=0.02",
+                "-p", "control_hz:=500.0",
                 "-p", "feedback_hz:=0.0",
             ]
             for name, value in parameters.items():
@@ -157,13 +160,13 @@ class OutputLifecycleTests(unittest.TestCase):
         self._nodes.append(output)
         return output
 
-    def _send_fresh_left_target(self, output: SharpaOutput, position: float = 0.3) -> None:
+    def _send_left_target(self, output: SharpaOutput, position: float = 0.3) -> None:
         for _ in range(100):
             stamp_ns = output.get_clock().now().nanoseconds
             if stamp_ns > self._last_source_stamp:
                 break
         else:
-            self.fail("ROS clock did not advance to a fresh source timestamp")
+            self.fail("ROS clock did not advance to an increasing source timestamp")
         self._last_source_stamp = stamp_ns
         message = JointState()
         message.header.stamp.sec = stamp_ns // 1_000_000_000
@@ -184,70 +187,72 @@ class OutputLifecycleTests(unittest.TestCase):
             "sharpa_teleop.sharpa_output.time.sleep", clock.sleep
         )
 
-    def test_latest_target_moves_without_waiting_for_a_second_sample(self):
+    def test_latest_target_reversal_is_smoothed_monotonically_without_overshoot(self):
         clock = FakeMonotonicClock()
         backend = FakeLifecycleBackend(clock, initial_position=0.3)
-        output = self._new_output(backend, control_hz=500.0)
+        output = self._new_output(backend, control_hz=500.0, smoothing_time_sec=0.02)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output, 0.8)
+            self._send_left_target(output, 0.8)
             self.assertTrue(self._request_enable(output, True).success)
             for tick in range(1, 6):
                 clock.now = tick * 0.002
                 output._on_control_timer()
-            self.assertEqual(len(backend.set_commands), 5)
-            for tick, (_, positions) in enumerate(backend.set_commands, 1):
-                for position in positions:
-                    self.assertAlmostEqual(position, 0.3 + tick * 0.002)
 
-            # Two targets arrive between ticks: only the latest may execute.
-            self._send_fresh_left_target(output, 0.9)
-            self._send_fresh_left_target(output, -0.2)
+            ascending = [positions[0] for _, positions in backend.set_commands]
+            self.assertGreaterEqual(len(ascending), 5)
+            self.assertAlmostEqual(ascending[0], 0.347581290982, places=12)
+            self.assertTrue(all(0.3 < position < 0.8 for position in ascending))
+            self.assertTrue(
+                all(previous < current for previous, current in zip(ascending, ascending[1:]))
+            )
+
+            # Two targets arrive between ticks: only the latest reversal may execute.
+            self._send_left_target(output, 0.9)
+            self._send_left_target(output, -0.2)
             clock.now += 0.002
             output._on_control_timer()
-            for position in backend.set_commands[-1][1]:
-                self.assertAlmostEqual(position, 0.308)
+            reversal = backend.set_commands[-1][1][0]
+            self.assertLess(reversal, ascending[-1])
+            self.assertGreater(reversal, -0.2)
 
-    def test_reached_target_streaming_does_not_refresh_input_watchdog(self):
+    def test_input_dropout_holds_last_target_and_repeats_reached_setpoint(self):
         clock = FakeMonotonicClock()
         backend = FakeLifecycleBackend(clock, initial_position=0.3)
         output = self._new_output(backend, control_hz=500.0)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output, 0.303)
+            self._send_left_target(output, 0.3)
             self.assertTrue(self._request_enable(output, True).success)
-            for tick in range(1, 5):
-                clock.now = tick * 0.002
+            for tick in (0.002, 0.501, 10.0):
+                clock.now = tick
                 output._on_control_timer()
-            self.assertEqual(len(backend.set_commands), 4)
-            for (_, positions), expected in zip(backend.set_commands, (0.302, 0.303, 0.303, 0.303)):
-                for position in positions:
-                    self.assertAlmostEqual(position, expected)
-            clock.now = 0.501
-            output._on_control_timer()
-            self.assertEqual(len(backend.set_commands), 4)
-            self.assertFalse(backend.enabled)
-            self.assertGreater(backend.disable_calls, 0)
-            self._send_fresh_left_target(output, 0.4)
-            output._on_control_timer()
-            self.assertEqual(backend.arm_calls, 1)
-            self.assertEqual(len(backend.set_commands), 4)
 
-    def test_delayed_control_tick_cannot_cause_a_large_catchup_step(self):
+        self.assertTrue(backend.enabled)
+        self.assertFalse(output._latched)
+        self.assertEqual(backend.disable_calls, 0)
+        self.assertGreaterEqual(len(backend.set_commands), 3)
+        self.assertTrue(
+            all(positions == (0.3,) * JOINT_COUNT for _, positions in backend.set_commands)
+        )
+
+    def test_delayed_control_uses_actual_elapsed_without_overshoot(self):
         clock = FakeMonotonicClock()
         backend = FakeLifecycleBackend(clock, initial_position=0.3)
-        output = self._new_output(backend, control_hz=500.0)
+        output = self._new_output(backend, control_hz=500.0, smoothing_time_sec=0.02)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output, 0.8)
+            self._send_left_target(output, 0.8)
             self.assertTrue(self._request_enable(output, True).success)
             clock.now = 0.1
             output._on_control_timer()
-            for position in backend.set_commands[-1][1]:
-                self.assertAlmostEqual(position, 0.302)
 
+        position = backend.set_commands[-1][1][0]
+        self.assertAlmostEqual(position, 0.7966310265, places=10)
+        self.assertGreater(position, 0.3)
+        self.assertLess(position, 0.8)
 
-    def test_auto_enable_waits_for_fresh_selected_target_and_arms_once(self):
+    def test_auto_enable_waits_for_valid_selected_target_and_arms_once(self):
         clock = FakeMonotonicClock()
         backend = FakeLifecycleBackend(clock)
         output = self._new_output(backend, auto_enable=True)
@@ -256,7 +261,7 @@ class OutputLifecycleTests(unittest.TestCase):
             output._on_control_timer()
             self.assertEqual(backend.arm_calls, 0)
 
-            self._send_fresh_left_target(output, 0.25)
+            self._send_left_target(output, 0.25)
             output._on_control_timer()
             output._on_control_timer()
 
@@ -271,37 +276,30 @@ class OutputLifecycleTests(unittest.TestCase):
         with monotonic, sleep:
             response = self._request_enable(output, False)
             self.assertTrue(response.success)
-            self._send_fresh_left_target(output)
+            self._send_left_target(output)
             output._on_control_timer()
 
         self.assertEqual(backend.arm_calls, 0)
         self.assertFalse(backend.enabled)
 
-    def test_watchdog_latch_blocks_auto_rearm_and_shutdown_motion(self):
+    def test_sdk_arm_failure_latches_and_prevents_auto_rearm(self):
         clock = FakeMonotonicClock()
-        backend = FakeLifecycleBackend(clock)
-        output = self._new_output(
-            backend, auto_enable=True, return_to_zero_on_exit=True, homing_timeout_sec=1.0
-        )
+        backend = FakeLifecycleBackend(clock, fail_arm=True)
+        output = self._new_output(backend, auto_enable=True)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output, 0.4)
             output._on_control_timer()
             self.assertEqual(backend.arm_calls, 1)
-
-            clock.now = 0.51
-            output._on_control_timer()
             self.assertFalse(backend.enabled)
-            set_commands_before_close = len(backend.set_commands)
+            self.assertTrue(output._latched)
+            self.assertGreaterEqual(backend.disable_calls, 1)
 
-            self._send_fresh_left_target(output, 0.2)
+            self._send_left_target(output, 0.2)
+            clock.now = 0.004
             output._on_control_timer()
-            self.assertEqual(backend.arm_calls, 1)
-            output.close(return_to_zero=True)
 
-        self.assertEqual(len(backend.set_commands), set_commands_before_close)
-        self.assertTrue(backend.closed)
-        self.assertFalse(backend.enabled)
+        self.assertEqual(backend.arm_calls, 1)
 
     def test_close_requires_an_explicit_return_request(self):
         clock = FakeMonotonicClock()
@@ -309,7 +307,7 @@ class OutputLifecycleTests(unittest.TestCase):
         output = self._new_output(backend, return_to_zero_on_exit=True)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output)
             response = self._request_enable(output, True)
             self.assertTrue(response.success)
             output.close()
@@ -330,30 +328,30 @@ class OutputLifecycleTests(unittest.TestCase):
         self.assertTrue(backend.closed)
         self.assertFalse(backend.enabled)
 
-    def test_healthy_close_homes_at_a_bounded_slew_and_waits_for_readback(self):
+    def test_near_pose_homing_converges_asymptotically_by_measured_tolerance(self):
         clock = FakeMonotonicClock()
-        backend = FakeLifecycleBackend(clock)
+        backend = FakeLifecycleBackend(clock, initial_position=0.021)
         output = self._new_output(
             backend,
             return_to_zero_on_exit=True,
             homing_timeout_sec=2.0,
             homing_tolerance_rad=0.02,
+            smoothing_time_sec=0.02,
         )
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output, 0.021)
             response = self._request_enable(output, True)
             self.assertTrue(response.success)
             output.close(return_to_zero=True)
 
-        previous = 0.3
-        previous_time = 0.0
-        for command_time, command in backend.set_commands:
-            self.assertLessEqual(command[0], previous + 1e-9)
-            self.assertLessEqual(previous - command[0], command_time - previous_time + 1e-9)
-            previous = command[0]
-            previous_time = command_time
-        self.assertAlmostEqual(previous, 0.0, delta=1e-9)
+        commands = [command[0] for _, command in backend.set_commands]
+        self.assertTrue(commands)
+        self.assertTrue(all(0.0 < command <= 0.021 for command in commands))
+        self.assertTrue(
+            all(previous >= current for previous, current in zip(commands, commands[1:]))
+        )
+        self.assertNotEqual(commands[-1], 0.0)
         self.assertTrue(backend.zero_observed_before_close)
         self.assertTrue(backend.closed)
         self.assertFalse(backend.enabled)
@@ -364,7 +362,7 @@ class OutputLifecycleTests(unittest.TestCase):
         output = self._new_output(backend, return_to_zero_on_exit=True)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output)
             response = self._request_enable(output, True)
             self.assertTrue(response.success)
             output.close(return_to_zero=True)
@@ -379,7 +377,7 @@ class OutputLifecycleTests(unittest.TestCase):
         output = self._new_output(backend, return_to_zero_on_exit=True)
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output)
             response = self._request_enable(output, True)
             self.assertTrue(response.success)
             output.close(return_to_zero=True)
@@ -400,7 +398,7 @@ class OutputLifecycleTests(unittest.TestCase):
         )
         monotonic, sleep = self._clock_patch(clock)
         with monotonic, sleep:
-            self._send_fresh_left_target(output)
+            self._send_left_target(output)
             response = self._request_enable(output, True)
             self.assertTrue(response.success)
             output.close(return_to_zero=True)
